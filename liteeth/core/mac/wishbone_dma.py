@@ -2,7 +2,7 @@ from math import log2
 
 from migen.fhdl.module import Module
 from migen.fhdl.structure import *
-from migen.genlib.fsm import FSM, NextState
+from migen.genlib.fsm import FSM, NextState, NextValue
 
 from litex.soc.interconnect import wishbone, stream
 from litex.soc.interconnect.csr import CSRStorage, CSRStatus, CSRConstant, AutoCSR
@@ -84,7 +84,7 @@ class _WishboneStreamDMABase(object):
 
         # These registers allow the CPU to determine the current number of buffers that
         # the DMA owns (i.e. buffers to be transmitted or filled with received data).
-        # The CPU first writes 0 to ring_count_update and then reads ring_count_value.
+        # The CPU first writes 1 to ring_count_update and then reads ring_count_value.
         # See _ring_count below for the meaning of this value.
         self._csr_ring_count_update = CSRStorage(1, name="ring_count_update")
         self._csr_ring_count_value = CSRStatus(buffer_index_bits, name="ring_count_value")
@@ -94,6 +94,12 @@ class _WishboneStreamDMABase(object):
         # one register write. It must not be wider than 8 bits because then CSR writes
         # are not atomic.
         self._csr_ring_submit = CSRStorage(8, name="ring_submit")
+
+        # This CSR is used by the CPU to stop DMA operation and reset the buffer position
+        # to zero. The CPU writes 1 into it and then waits until ring_count (see above)
+        # is zero. The driver must do this at initialization if there is any possiblilty
+        # that the DMA is in a non-reset state.
+        self._csr_soft_reset = CSRStorage(1, name="soft_reset")
 
         # Signal definitions and logic start here.
 
@@ -108,6 +114,19 @@ class _WishboneStreamDMABase(object):
         #   was transmitted or filled with data), _ring_count is decremented by 1.
         self._ring_count = Signal(buffer_index_bits)
 
+        # This signal is uses to latch a soft reset request.
+        self._latch_soft_reset = Signal(1)
+        self.sync += \
+            If(self._csr_soft_reset.re, \
+                self._latch_soft_reset.eq(1)
+            )
+
+        # This internal signal is set when the soft reset should be done. It has a comb
+        # default value 0 and is assigned to 1 in the FSM when the soft reset should
+        # be done.
+        self._do_soft_reset = Signal(1)
+        self.comb += self._do_soft_reset.eq(0)
+
         # Implementation of _csr_ring_count_update and _csr_ring_count_value. The value
         # of _csr_ring_count_value is updated the the actual _ring_count when 
         # _csr_ring_count_update is written.
@@ -117,11 +136,16 @@ class _WishboneStreamDMABase(object):
             )
         
         # Helper signals for incrementing/decrementing _ring_count, and the statement that
-        # actually updates _ring_count.
+        # actually updates _ring_count, or resets it when doing soft reset.
         self._ring_count_inc = Signal(8)
         self._ring_count_dec = Signal(1)
-        self.sync += self._ring_count.eq(
-            self._ring_count + self._ring_count_inc - self._ring_count_dec)
+        self.sync += \
+            If(self._do_soft_reset,
+                self._ring_count.eq(0),
+            ).Else(
+                self._ring_count.eq(
+                    self._ring_count + self._ring_count_inc - self._ring_count_dec)
+            )
 
         # Implementation of the ring_submit CSR. If a value is being written to
         # csr_ring_submit then increment ring_count by the written value, no increment
@@ -133,19 +157,28 @@ class _WishboneStreamDMABase(object):
                 self._ring_count_inc.eq(0)
             )
         
-        # Implementation of releating a buffer. The FSM below is responsible determining
-        # when to release a buffer by assigning to _release_buffer. A buffer can only b
-        # released when _ring_pos is greater than 0.
+        # Implementation of releating a buffer and resetting _ring_pos. The FSM below is
+        # responsible determining when to release a buffer by assigning to _release_buffer.
+        # A buffer can only be released when _ring_pos is greater than 0.
         self._release_buffer = Signal(1)
-        self.comb += self._ring_count_dec.eq(self._release_buffer)
-        self.sync += \
-            If(self._release_buffer == 1,
+        self.comb += [
+            # Default value.
+            self._release_buffer.eq(0),
+            # Decrement ring_count by one when a buffer is released.
+            self._ring_count_dec.eq(self._release_buffer)
+        ]
+        self.sync += [
+            If(self._do_soft_reset,
+                self._ring_pos.eq(0)
+            ) \
+            .Elif(self._release_buffer,
                 If(self._ring_pos == self._csr_ring_size_m1.storage,
                     self._ring_pos.eq(0)
                 ).Else(
                     self._ring_pos.eq(self._ring_pos + 1)
                 )
             )
+        ]
         
         # FSM which does the following in a loop:
         # - Wait for a buffer to be available (WAIT_BUFFER).
@@ -175,9 +208,17 @@ class _WishboneStreamDMABase(object):
         self._desc_value = Signal(64)
 
         fsm.act("WAIT_BUFFER",
+            # If soft reset is needed, do it.
+            If(self._latch_soft_reset,
+                # Comb-assign 1 to _do_soft_reset so that _ring_count and _ring_pos
+                # will be reset to zero in next cycle transition.
+                self._do_soft_reset.eq(1),
+                # Clear _latch_soft_reset now that we have done the soft reset.
+                NextValue(self._latch_soft_reset, 0)
+            )
             # If we have a buffer, calculate the descriptor address and continue in
             # READ_DESC_1.
-            If(self._ring_count > 0,
+            .Elif(self._ring_count > 0,
                 NextValue(desc_addr,
                     (self._csr_ring_addr.storage >> mem_align_addr_bits) +
                     self._ring_pos * desc_size_words),
@@ -195,8 +236,7 @@ class _WishboneStreamDMABase(object):
             If(wb_master.ack,
                 NextValue(self._desc_value[0:wb_data_width], wb_master.dat_r),
                 If(wb_data_width == 32,
-                    NextValue(desc_addr, desc_addr + 1),
-                    NextState("READ_DESC_2")
+                    NextState("READ_DESC_INC_ADDR")
                 ).Else(
                     NextState("PROCESS_BUFFER")
                 )
@@ -204,6 +244,11 @@ class _WishboneStreamDMABase(object):
         )
 
         if wb_data_width == 32:
+            fsm.act("READ_DESC_INC_ADDR",
+                NextValue(desc_addr, desc_addr + 1),
+                NextState("READ_DESC_2")
+            )
+
             fsm.act("READ_DESC_2",
                 wb_master.adr.eq(desc_addr),
                 wb_master.sel.eq(0b1111),
@@ -224,16 +269,12 @@ class _WishboneStreamDMABase(object):
         self._update_descriptor = Signal(1)
         self._update_descriptor_value = Signal(32)
 
-        # Default value when not set below.
-        self.comb += self._release_buffer.eq(0)
-        
         fsm.act("PROCESS_BUFFER",
             If(self._buffer_processed == 1,
                 If(self._update_descriptor == 1,
                     NextState("WRITE_DESC")
                 ).Else(
-                    self._release_buffer.eq(1),
-                    NextState("WAIT_BUFFER")
+                    NextState("RELEASE_BUFFER")
                 )
             )
         )
@@ -249,9 +290,13 @@ class _WishboneStreamDMABase(object):
             wb_master.we.eq(1),
             # TODO: Handle error (wb_master.err)
             If(wb_master.ack,
-                self._release_buffer.eq(1),
-                NextState("WAIT_BUFFER")
+                NextState("RELEASE_BUFFER")
             )
+        )
+
+        fsm.act("RELEASE_BUFFER",
+            self._release_buffer.eq(1),
+            NextState("WAIT_BUFFER")
         )
 
 
