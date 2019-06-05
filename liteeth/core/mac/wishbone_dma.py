@@ -236,8 +236,10 @@ class _WishboneStreamDMABase(object):
             wb_master.cyc.eq(1),
             wb_master.stb.eq(1),
             wb_master.we.eq(0),
-            # TODO: Handle error (wb_master.err)
-            If(wb_master.ack,
+            If(wb_master.err,
+                NextState("ERROR")
+            )
+            .Elif(wb_master.ack,
                 NextValue(self._desc_value[0:wb_data_width], wb_master.dat_r),
                 If(wb_data_width == 32,
                     NextState("READ_DESC_INC_ADDR")
@@ -259,8 +261,10 @@ class _WishboneStreamDMABase(object):
                 wb_master.cyc.eq(1),
                 wb_master.stb.eq(1),
                 wb_master.we.eq(0),
-                # TODO: Handle error (wb_master.err)
-                If(wb_master.ack,
+                If(wb_master.err,
+                    NextState("ERROR")
+                )
+                .Elif(wb_master.ack,
                     NextValue(self._desc_value[wb_data_width:], wb_master.dat_r),
                     NextState("PROCESS_BUFFER")
                 )
@@ -292,8 +296,10 @@ class _WishboneStreamDMABase(object):
             wb_master.cyc.eq(1),
             wb_master.stb.eq(1),
             wb_master.we.eq(1),
-            # TODO: Handle error (wb_master.err)
-            If(wb_master.ack,
+            If(wb_master.err,
+                NextState("ERROR")
+            )
+            .Elif(wb_master.ack,
                 NextState("RELEASE_BUFFER")
             )
         )
@@ -301,6 +307,14 @@ class _WishboneStreamDMABase(object):
         fsm.act("RELEASE_BUFFER",
             self._release_buffer.eq(1),
             NextState("WAIT_BUFFER")
+        )
+
+        fsm.act("ERROR",
+            # Stay here waiting for soft reset. Once found, just go to WAIT_BUFFER where
+            # it will actually be handled.
+            If(self._latch_soft_reset,
+                NextState("WAIT_BUFFER")
+            )
         )
 
 
