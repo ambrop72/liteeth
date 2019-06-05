@@ -116,10 +116,11 @@ class _WishboneStreamDMABase(object):
 
         # This signal is uses to latch a soft reset request.
         self._latch_soft_reset = Signal(1)
-        self.sync += \
-            If(self._csr_soft_reset.re, \
+        self.sync += [
+            If(self._csr_soft_reset.re,
                 self._latch_soft_reset.eq(1)
             )
+        ]
 
         # This internal signal is set when the soft reset should be done. It has a comb
         # default value 0 and is assigned to 1 in the FSM when the soft reset should
@@ -130,32 +131,35 @@ class _WishboneStreamDMABase(object):
         # Implementation of _csr_ring_count_update and _csr_ring_count_value. The value
         # of _csr_ring_count_value is updated the the actual _ring_count when 
         # _csr_ring_count_update is written.
-        self.sync += \
+        self.sync += [
             If(self._csr_ring_count_update.re,
                 self._csr_ring_count_value.status.eq(self._ring_count)
             )
+        ]
         
         # Helper signals for incrementing/decrementing _ring_count, and the statement that
         # actually updates _ring_count, or resets it when doing soft reset.
         self._ring_count_inc = Signal(8)
         self._ring_count_dec = Signal(1)
-        self.sync += \
+        self.sync += [
             If(self._do_soft_reset,
                 self._ring_count.eq(0),
             ).Else(
                 self._ring_count.eq(
                     self._ring_count + self._ring_count_inc - self._ring_count_dec)
             )
+        ]
 
         # Implementation of the ring_submit CSR. If a value is being written to
         # csr_ring_submit then increment ring_count by the written value, no increment
         # is done.
-        self.comb += \
+        self.comb += [
             If(self._csr_ring_submit.re,
                 self._ring_count_inc.eq(self._csr_ring_submit.storage)
             ).Else(
                 self._ring_count_inc.eq(0)
             )
+        ]
         
         # Implementation of releating a buffer and resetting _ring_pos. The FSM below is
         # responsible determining when to release a buffer by assigning to _release_buffer.
@@ -170,7 +174,7 @@ class _WishboneStreamDMABase(object):
         self.sync += [
             If(self._do_soft_reset,
                 self._ring_pos.eq(0)
-            ) \
+            )
             .Elif(self._release_buffer,
                 If(self._ring_pos == self._csr_ring_size_m1.storage,
                     self._ring_pos.eq(0)
