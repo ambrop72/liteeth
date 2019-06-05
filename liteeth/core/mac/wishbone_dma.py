@@ -20,7 +20,7 @@ def _get_stream_data_width(stream_desc):
 
 
 class _WishboneStreamDMABase(object):
-    def __init__(self, stream_desc, wb_data_width, wb_adr_width):
+    def __init__(self, stream_desc, wb_data_width, wb_adr_width, process_fsm_state):
         # We support only 32-bit or 64-bit wishbone data width, and only 30-bit address
         # width.
         assert wb_data_width in (32, 64)
@@ -208,10 +208,19 @@ class _WishboneStreamDMABase(object):
             wb_master.bte.eq(0),
         ]
 
-        # Signals for temporary values. The _desc_value contains the read descriptor
-        # value and is read by the derived class during PROCESS_BUFFER.
+        # Temporary storage for the descriptor address.
         desc_addr = Signal(wb_adr_width)
-        self._desc_value = Signal(64)
+
+        # The following are set here based on the descriptor. They can be read from the
+        # processing code in the deriver class and also updated during processing.
+        # - Buffer address for Wishbone (not byte address).
+        # - Buffer size in bytes.
+        # - Data size in bytes.
+        # - End-of-packet bit.
+        self._buffer_addr = Signal(wb_adr_width)
+        self._buffer_size = Signal(buffer_size_bits)
+        self._buffer_data_size = Signal(buffer_size_bits)
+        self._buffer_last = Signal(1)
 
         fsm.act("WAIT_BUFFER",
             # If soft reset is needed, do it.
@@ -232,6 +241,13 @@ class _WishboneStreamDMABase(object):
             )
         )
 
+        def save_desc_second_word(desc_second_word):
+            return [
+                NextValue(self._buffer_size, desc_second_word & 0x7FFF),
+                NextValue(self._buffer_data_size, (desc_second_word >> 15) & 0x7FFF),
+                NextValue(self._buffer_last, (desc_second_word >> 30) & 1),
+            ]
+
         fsm.act("READ_DESC_1",
             # Read the descriptor (first word or complete).
             wb_master.adr.eq(desc_addr),
@@ -243,11 +259,12 @@ class _WishboneStreamDMABase(object):
                 NextState("ERROR")
             )
             .Elif(wb_master.ack,
-                NextValue(self._desc_value[0:wb_data_width], wb_master.dat_r),
+                NextValue(self._buffer_addr, (wb_master.dat_r & 0xFFFFFFFF) >> mem_align_addr_bits),
                 If(wb_data_width == 32,
                     NextState("READ_DESC_INC_ADDR")
                 ).Else(
-                    NextState("PROCESS_BUFFER")
+                    *save_desc_second_word(wb_master.dat_r >> 32),
+                    NextState(process_fsm_state)
                 )
             )
         )
@@ -268,27 +285,20 @@ class _WishboneStreamDMABase(object):
                     NextState("ERROR")
                 )
                 .Elif(wb_master.ack,
-                    NextValue(self._desc_value[wb_data_width:], wb_master.dat_r),
-                    NextState("PROCESS_BUFFER")
+                    *save_desc_second_word(wb_master.dat_r),
+                    NextState(process_fsm_state)
                 )
             )
         
-        # The derived class indicates when processing of the buffer has been completed
-        # by driving the _buffer_processed signal. It also indicates whether the
-        # second word of the descriptor should be updated and to which value.
-        self._buffer_processed = Signal(1)
-        self._update_descriptor = Signal(1)
-        self._update_descriptor_value = Signal(32)
+        # By going to process_fsm_state we pass control to the derived class.
+        # The derived class will eventually transition to one of:
+        # - WRITE_DESC: If it's done and the descriptor should be updated.
+        # - RELEASE_BUFFER: If it's done and the descriptor should not be updated.
+        # - ERROR: If there was an error.
 
-        fsm.act("PROCESS_BUFFER",
-            If(self._buffer_processed,
-                If(self._update_descriptor,
-                    NextState("WRITE_DESC")
-                ).Else(
-                    NextState("RELEASE_BUFFER")
-                )
-            )
-        )
+        # If the transition was to WRITE_DESC, the base class assigned the value
+        # to write to the second word of the descriptor this signal.
+        self._update_descriptor_value = Signal(32)
 
         fsm.act("WRITE_DESC",
             wb_master.adr.eq(desc_addr),
@@ -323,14 +333,96 @@ class _WishboneStreamDMABase(object):
 
 class WishboneStreamDMARead(Module, AutoCSR, _WishboneStreamDMABase):
     def __init__(self, stream_desc, wb_data_width=32, wb_adr_width=30):
-        _WishboneStreamDMABase.__init__(self, stream_desc, wb_data_width, wb_adr_width)
+        _WishboneStreamDMABase.__init__(
+            self, stream_desc, wb_data_width, wb_adr_width, "CHECK_BUF_POS")
 
-        self.source = stream.Endpoint(stream_desc)
+        source = stream.Endpoint(stream_desc)
+        self.source = source
+
+        fsm = self.fsm
+        wb_master = self.wb_master
+
+        self.comb += [
+            source.valid.eq(0),
+        ]
+
+        wb_data_width_bytes = wb_data_width // 8
+
+        # This signal indicated whether the next data word will start a new packet. It
+        # is a state that persists across processing of individual buffers.
+        first_word_in_packet = Signal(1, reset=1)
+
+        self.sync += [
+            # Reset first_word_in_packet to 1 at soft reset.
+            If(self._do_soft_reset,
+                first_word_in_packet.eq(1)
+            )
+        ]
+
+        # These are temporary storage during processing of a buffer.
+        data_sel = Signal(wb_data_width_bytes)
+        last_be = Signal(wb_data_width_bytes)
+        last_word_in_packet = Signal(1)
+        data_word = Signal(wb_data_width)
+
+        # TODO: Pipeline these states.
+
+        fsm.act("CHECK_BUF_POS",
+            If(self._buffer_data_size == 0,
+                NextState("RELEASE_BUFFER")
+            ).Else(
+                If(self._buffer_data_size <= wb_data_width_bytes,
+                    NextValue(self._buffer_data_size, 0),
+                    NextValue(data_sel, (1 << self._buffer_data_size) - 1),
+                    NextValue(last_be, 1 << (self._buffer_data_size - 1)),
+                    NextValue(last_word_in_packet, self._buffer_last),
+                ).Else(
+                    NextValue(self._buffer_data_size, self._buffer_data_size - wb_data_width_bytes),
+                    NextValue(data_sel, (1 << wb_data_width_bytes) - 1),
+                    NextValue(last_be, 0),
+                    NextValue(last_word_in_packet, 0),
+                ),
+                NextState("READ_DATA_FROM_WB")
+            )
+        )
+
+        fsm.act("READ_DATA_FROM_WB",
+            wb_master.adr.eq(self._buffer_addr),
+            wb_master.sel.eq(data_sel),
+            wb_master.cyc.eq(1),
+            wb_master.stb.eq(1),
+            wb_master.we.eq(0),
+            If(wb_master.err,
+                NextState("ERROR")
+            )
+            .Elif(wb_master.ack,
+                NextValue(data_word, wb_master.dat_r),
+                NextValue(self._buffer_addr, self._buffer_addr + 1),
+                NextState("PASS_DATA_TO_STREAM")
+            )
+        )
+
+        fsm.act("PASS_DATA_TO_STREAM",
+            source.valid.eq(1),
+            source.first.eq(first_word_in_packet),
+            source.last.eq(last_word_in_packet),
+            source.payload.data.eq(data_word),
+            source.payload.last_be.eq(last_be),
+            source.payload.error.eq(0),
+            If(self._latch_soft_reset,
+                NextState("WAIT_BUFFER")
+            )
+            .Elif(source.ready,
+                NextValue(first_word_in_packet, last_word_in_packet),
+                NextState("CHECK_BUF_POS")
+            )
+        )
 
 
 class WishboneStreamDMAWrite(Module, AutoCSR, _WishboneStreamDMABase):
     def __init__(self, stream_desc, wb_data_width=32, wb_adr_width=30):
-        _WishboneStreamDMABase.__init__(self, stream_desc, wb_data_width, wb_adr_width)
+        _WishboneStreamDMABase.__init__(
+            self, stream_desc, wb_data_width, wb_adr_width, "CHECK_BUF_POS")
 
         self.sink = stream.Endpoint(stream_desc)
 
