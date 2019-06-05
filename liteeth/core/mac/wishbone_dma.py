@@ -208,6 +208,8 @@ class _WishboneStreamDMABase(object):
             wb_master.bte.eq(0),
         ]
 
+        # Signals for temporary values. The _desc_value contains the read descriptor
+        # value and is read by the derived class during PROCESS_BUFFER.
         desc_addr = Signal(wb_adr_width)
         self._desc_value = Signal(64)
 
@@ -231,6 +233,7 @@ class _WishboneStreamDMABase(object):
         )
 
         fsm.act("READ_DESC_1",
+            # Read the descriptor (first word or complete).
             wb_master.adr.eq(desc_addr),
             wb_master.sel.eq(0b1111 if wb_data_width == 32 else 0b11111111),
             wb_master.cyc.eq(1),
@@ -278,8 +281,8 @@ class _WishboneStreamDMABase(object):
         self._update_descriptor_value = Signal(32)
 
         fsm.act("PROCESS_BUFFER",
-            If(self._buffer_processed == 1,
-                If(self._update_descriptor == 1,
+            If(self._buffer_processed,
+                If(self._update_descriptor,
                     NextState("WRITE_DESC")
                 ).Else(
                     NextState("RELEASE_BUFFER")
