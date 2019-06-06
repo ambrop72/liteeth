@@ -224,12 +224,18 @@ class _WishboneStreamDMABase(object):
                 # Clear _latch_soft_reset now that we have done the soft reset.
                 NextValue(self._latch_soft_reset, 0)
             )
-            # If we have a buffer, calculate the descriptor address and continue in
-            # READ_DESC_1.
+            # If we have a buffer available, prepare some things and continue.
             .Elif(self._ring_count > 0,
+                # Calculate the descriptor address based on _csr_ring_addr and _ring_pos.
                 NextValue(desc_addr, desc_addr_calc_sig),
                 If(wb_data_width == 32,
                     NextValue(desc_addr2, desc_addr_calc_sig + 1)
+                ),
+                # Increment _ring_pos by one (with wrap-around).
+                If(self._ring_pos == self._csr_ring_size_m1.storage,
+                    NextValue(self._ring_pos, 0)
+                ).Else(
+                    NextValue(self._ring_pos, self._ring_pos + 1)
                 ),
                 NextState("READ_DESC_1")
             )
@@ -272,7 +278,7 @@ class _WishboneStreamDMABase(object):
         )
 
         if wb_data_width == 32:
-            # Read the second word ofthe descriptor.
+            # Read the second word of the descriptor.
             fsm.act("READ_DESC_2",
                 wb_master.adr.eq(desc_addr2),
                 wb_master.sel.eq((1 << wb_data_width_bytes) - 1),
@@ -317,12 +323,6 @@ class _WishboneStreamDMABase(object):
         )
 
         fsm.act("RELEASE_BUFFER",
-            # Increment _ring_pos by one (with wrap-around).
-            If(self._ring_pos == self._csr_ring_size_m1.storage,
-                NextValue(self._ring_pos, 0)
-            ).Else(
-                NextValue(self._ring_pos, self._ring_pos + 1)
-            ),
             # Decrement _ring_count by one.
             self._ring_count_dec.eq(1),
             NextState("WAIT_BUFFER")
