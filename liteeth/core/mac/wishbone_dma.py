@@ -37,10 +37,10 @@ class _WishboneStreamDMABase(object):
         # There is no support for data width mismatch between WB and stream for now.
         assert self._stream_data_width == wb_data_width
 
-        # Figure out the memory alignment (based on the widhbone data width) in bytes and
-        # the associated number of low address bits.
-        mem_align_bytes = wb_data_width // 8
-        mem_align_addr_bits = int(log2(mem_align_bytes))
+        # Wishbone data width in bytes and corresponding number of address bits in byte
+        # addresses (number of bits to strip to get from byte to WB address).
+        wb_data_width_bytes = wb_data_width // 8
+        wb_data_width_addr_bits = int(log2(wb_data_width_bytes))
 
         # Number of bits for representing buffer counts and indices (16 bits allows at
         # most 65535 buffers).
@@ -51,7 +51,7 @@ class _WishboneStreamDMABase(object):
 
         # Define a CSR constant for the required alignment of the ring buffer and data
         # buffers, so the CPU can be sure to align correctly.
-        self._csr_mem_align = CSRConstant(mem_align_bytes, name="mem_align")
+        self._csr_mem_align = CSRConstant(wb_data_width_bytes, name="mem_align")
 
         # The CPU configures the address and size of the ring buffer containing buffer
         # descriptors (see below) by writing values into these registers. ring_addr
@@ -226,7 +226,7 @@ class _WishboneStreamDMABase(object):
 
         desc_addr_calc_sig = Signal(wb_adr_width)
         self.comb += desc_addr_calc_sig.eq(
-            (self._csr_ring_addr.storage >> mem_align_addr_bits) +
+            (self._csr_ring_addr.storage >> wb_data_width_addr_bits) +
             self._ring_pos * desc_size_words
         )
 
@@ -252,7 +252,7 @@ class _WishboneStreamDMABase(object):
 
         def save_desc_first_word(desc_first_word):
             return [
-                NextValue(self._buffer_addr, desc_first_word >> mem_align_addr_bits),
+                NextValue(self._buffer_addr, desc_first_word >> wb_data_width_addr_bits),
             ]
 
         def save_desc_second_word(desc_second_word):
@@ -265,7 +265,7 @@ class _WishboneStreamDMABase(object):
         fsm.act("READ_DESC_1",
             # Read the descriptor (first word or complete).
             wb_master.adr.eq(desc_addr),
-            wb_master.sel.eq(0b1111 if wb_data_width == 32 else 0b11111111),
+            wb_master.sel.eq((1 << wb_data_width_bytes) - 1)
             wb_master.cyc.eq(1),
             wb_master.stb.eq(1),
             wb_master.we.eq(0),
@@ -290,7 +290,7 @@ class _WishboneStreamDMABase(object):
             # Read the second word ofthe descriptor.
             fsm.act("READ_DESC_2",
                 wb_master.adr.eq(desc_addr2),
-                wb_master.sel.eq(0b1111),
+                wb_master.sel.eq((1 << wb_data_width_bytes) - 1),
                 wb_master.cyc.eq(1),
                 wb_master.stb.eq(1),
                 wb_master.we.eq(0),
@@ -319,7 +319,7 @@ class _WishboneStreamDMABase(object):
             wb_master.dat_w.eq(
                 self._update_descriptor_value if wb_data_width == 32
                 else (self._update_descriptor_value << 32)),
-            wb_master.sel.eq(0b1111 if wb_data_width == 32 else 0b11110000),
+            wb_master.sel.eq(0b1111 << (0 if wb_data_width == 32 else 4)),
             wb_master.cyc.eq(1),
             wb_master.stb.eq(1),
             wb_master.we.eq(1),
