@@ -210,6 +210,8 @@ class _WishboneStreamDMABase(object):
 
         # Temporary storage for the descriptor address.
         desc_addr = Signal(wb_adr_width)
+        if wb_data_width == 32:
+            desc_addr2 = Signal(wb_adr_width)
 
         # The following are set here based on the descriptor. They can be read from the
         # processing code in the deriver class and also updated during processing.
@@ -221,6 +223,12 @@ class _WishboneStreamDMABase(object):
         self._buffer_size = Signal(buffer_size_bits)
         self._buffer_data_size = Signal(buffer_size_bits)
         self._buffer_last = Signal(1)
+
+        desc_addr_calc_sig = Signal(wb_adr_width)
+        self.comb += desc_addr_calc_sig.eq(
+            (self._csr_ring_addr.storage >> mem_align_addr_bits) +
+            self._ring_pos * desc_size_words
+        )
 
         fsm.act("WAIT_BUFFER",
             # If soft reset is needed, do it.
@@ -234,12 +242,18 @@ class _WishboneStreamDMABase(object):
             # If we have a buffer, calculate the descriptor address and continue in
             # READ_DESC_1.
             .Elif(self._ring_count > 0,
-                NextValue(desc_addr,
-                    (self._csr_ring_addr.storage >> mem_align_addr_bits) +
-                    self._ring_pos * desc_size_words),
+                NextValue(desc_addr, desc_addr_calc_sig),
+                If(wb_data_width == 32,
+                    NextValue(desc_addr2, desc_addr_calc_sig + 1)
+                ),
                 NextState("READ_DESC_1")
             )
         )
+
+        def save_desc_first_word(desc_first_word):
+            return [
+                NextValue(self._buffer_addr, desc_first_word >> mem_align_addr_bits),
+            ]
 
         def save_desc_second_word(desc_second_word):
             return [
@@ -259,10 +273,13 @@ class _WishboneStreamDMABase(object):
                 NextState("ERROR")
             )
             .Elif(wb_master.ack,
-                NextValue(self._buffer_addr, (wb_master.dat_r & 0xFFFFFFFF) >> mem_align_addr_bits),
                 If(wb_data_width == 32,
-                    NextState("READ_DESC_INC_ADDR")
+                    # Store the first word, read the second word now.
+                    *save_desc_first_word(wb_master.dat_r),
+                    NextState("READ_DESC_2")
                 ).Else(
+                    # Got the entire descriptor, store it and continug processing.
+                    *save_desc_first_word(wb_master.dat_r & 0xFFFFFFFF),
                     *save_desc_second_word(wb_master.dat_r >> 32),
                     NextState(process_fsm_state)
                 )
@@ -270,13 +287,9 @@ class _WishboneStreamDMABase(object):
         )
 
         if wb_data_width == 32:
-            fsm.act("READ_DESC_INC_ADDR",
-                NextValue(desc_addr, desc_addr + 1),
-                NextState("READ_DESC_2")
-            )
-
+            # Read the second word ofthe descriptor.
             fsm.act("READ_DESC_2",
-                wb_master.adr.eq(desc_addr),
+                wb_master.adr.eq(desc_addr2),
                 wb_master.sel.eq(0b1111),
                 wb_master.cyc.eq(1),
                 wb_master.stb.eq(1),
@@ -285,6 +298,7 @@ class _WishboneStreamDMABase(object):
                     NextState("ERROR")
                 )
                 .Elif(wb_master.ack,
+                    # Store the second word and continug processing.
                     *save_desc_second_word(wb_master.dat_r),
                     NextState(process_fsm_state)
                 )
