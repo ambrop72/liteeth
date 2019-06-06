@@ -103,6 +103,11 @@ class _WishboneStreamDMABase(object):
 
         # Signal definitions and logic start here.
 
+        # Signal which is comb-assigned to indicate when a soft reset is actually being
+        # done. It is used to reset _ring_count and also allows the derived class to reset
+        # its own states at that time.
+        self._doing_soft_reset = Signal(1)
+
         # The _ring_pos is the index of the first buffer that the DMA owns.
         self._ring_pos = Signal(buffer_index_bits)
 
@@ -114,6 +119,19 @@ class _WishboneStreamDMABase(object):
         #   was transmitted or filled with data), _ring_count is decremented by 1.
         self._ring_count = Signal(buffer_index_bits)
 
+        # Logic of for updating _ring_count. The _ring_count_inc and _ring_count_dec are
+        # comb-assigned in other logic.
+        self._ring_count_inc = Signal(8)
+        self._ring_count_dec = Signal(1)
+        self.sync += [
+            If(self._doing_soft_reset,
+                self._ring_count.eq(0)
+            ).Else(
+                self._ring_count.eq(
+                    self._ring_count + self._ring_count_inc - self._ring_count_dec)
+            )
+        ]
+
         # This signal is uses to latch a soft reset request.
         self._latch_soft_reset = Signal(1)
         self.sync += [
@@ -121,12 +139,6 @@ class _WishboneStreamDMABase(object):
                 self._latch_soft_reset.eq(1)
             )
         ]
-
-        # This internal signal is set when the soft reset should be done. It has a comb
-        # default value 0 and is assigned to 1 in the FSM when the soft reset should
-        # be done.
-        self._do_soft_reset = Signal(1)
-        self.comb += self._do_soft_reset.eq(0)
 
         # Implementation of _csr_ring_count_update and _csr_ring_count_value. The value
         # of _csr_ring_count_value is updated the the actual _ring_count when 
@@ -137,50 +149,11 @@ class _WishboneStreamDMABase(object):
             )
         ]
         
-        # Helper signals for incrementing/decrementing _ring_count, and the statement that
-        # actually updates _ring_count, or resets it when doing soft reset.
-        self._ring_count_inc = Signal(8)
-        self._ring_count_dec = Signal(1)
-        self.sync += [
-            If(self._do_soft_reset,
-                self._ring_count.eq(0),
-            ).Else(
-                self._ring_count.eq(
-                    self._ring_count + self._ring_count_inc - self._ring_count_dec)
-            )
-        ]
-
         # Implementation of the ring_submit CSR. If a value is being written to
-        # csr_ring_submit then increment ring_count by the written value, no increment
-        # is done.
+        # csr_ring_submit then increment ring_count by the written value.
         self.comb += [
             If(self._csr_ring_submit.re,
                 self._ring_count_inc.eq(self._csr_ring_submit.storage)
-            ).Else(
-                self._ring_count_inc.eq(0)
-            )
-        ]
-        
-        # Implementation of releating a buffer and resetting _ring_pos. The FSM below is
-        # responsible determining when to release a buffer by assigning to _release_buffer.
-        # A buffer can only be released when _ring_pos is greater than 0.
-        self._release_buffer = Signal(1)
-        self.comb += [
-            # Default value.
-            self._release_buffer.eq(0),
-            # Decrement ring_count by one when a buffer is released.
-            self._ring_count_dec.eq(self._release_buffer)
-        ]
-        self.sync += [
-            If(self._do_soft_reset,
-                self._ring_pos.eq(0)
-            )
-            .Elif(self._release_buffer,
-                If(self._ring_pos == self._csr_ring_size_m1.storage,
-                    self._ring_pos.eq(0)
-                ).Else(
-                    self._ring_pos.eq(self._ring_pos + 1)
-                )
             )
         ]
         
@@ -224,6 +197,8 @@ class _WishboneStreamDMABase(object):
         self._buffer_data_size = Signal(buffer_size_bits)
         self._buffer_last = Signal(1)
 
+        # Comb-defined signal for calculating the descriptor address to avoid
+        # duplicatication when we need the +1 address.
         desc_addr_calc_sig = Signal(wb_adr_width)
         self.comb += desc_addr_calc_sig.eq(
             (self._csr_ring_addr.storage >> wb_data_width_addr_bits) +
@@ -233,9 +208,11 @@ class _WishboneStreamDMABase(object):
         fsm.act("WAIT_BUFFER",
             # If soft reset is needed, do it.
             If(self._latch_soft_reset,
-                # Comb-assign 1 to _do_soft_reset so that _ring_count and _ring_pos
-                # will be reset to zero in next cycle transition.
-                self._do_soft_reset.eq(1),
+                # Set _doing_soft_reset to reset _ring_count and also let the derived
+                # class reset its own states.
+                self._doing_soft_reset.eq(1),
+                # Reset _ring_pos.
+                NextValue(self._ring_pos, 0),
                 # Clear _latch_soft_reset now that we have done the soft reset.
                 NextValue(self._latch_soft_reset, 0)
             )
@@ -332,7 +309,14 @@ class _WishboneStreamDMABase(object):
         )
 
         fsm.act("RELEASE_BUFFER",
-            self._release_buffer.eq(1),
+            # Increment _ring_pos by one (with wrap-around).
+            If(self._ring_pos == self._csr_ring_size_m1.storage,
+                NextValue(self._ring_pos, 0)
+            ).Else(
+                NextValue(self._ring_pos, self._ring_pos + 1)
+            ),
+            # Decrement _ring_count by one.
+            self._ring_count_dec.eq(1),
             NextState("WAIT_BUFFER")
         )
 
@@ -368,7 +352,7 @@ class WishboneStreamDMARead(Module, AutoCSR, _WishboneStreamDMABase):
 
         self.sync += [
             # Reset first_word_in_packet to 1 at soft reset.
-            If(self._do_soft_reset,
+            If(self._doing_soft_reset,
                 first_word_in_packet.eq(1)
             )
         ]
