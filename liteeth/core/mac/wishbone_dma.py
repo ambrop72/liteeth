@@ -83,15 +83,21 @@ class _WishboneStreamDMABase(object):
         desc_size_words = 64 // wb_data_width
 
         # General status register.
-        #   bit 0: Error state. Do soft reset to restart (see soft_reset).
+        #   bit 0: Error state. Do soft reset to restart (see _csr_ctrl).
+        #   bit 1: Soft reset in progress (see _csr_ctrl).
         self._csr_stat = CSRStatus(8, name='stat')
 
-        # These registers allow the CPU to determine the current number of buffers that
-        # the DMA owns (i.e. buffers to be transmitted or filled with received data).
-        # The CPU first writes 1 to ring_count_update and then reads ring_count_value.
-        # See _ring_count below for the meaning of this value.
-        self._csr_ring_count_update = CSRStorage(1, name="ring_count_update")
-        self._csr_ring_count_value = CSRStatus(buffer_index_bits, name="ring_count_value")
+        # General control register.
+        #   bit 0: Write 1 to refresh _csr_ring_count (see the comment there).
+        #   bit 1: Write 1 to perform soft reset. This is needed at initialization to
+        #     stop operation and reset _ring_count to zero. After requesting soft reset,
+        #     wait until the soft reset bit in _csr_stat is cleared.
+        self._csr_ctrl = CSRStorage(8, name="ctrl")
+
+        # This register is used to determine the current number of buffers that the DMA
+        # owns (buffers to be transmitted or filled with received data). It is updated
+        # only when the CPU writes 1 to bit 0 in _csr_ctrl.
+        self._csr_ring_count = CSRStatus(buffer_index_bits, name="ring_count")
 
         # The CPU writes to this register to submit a number of buffers (the written
         # number) to the DMA. Due to its width at most 255 buffers can be submitted with
@@ -99,17 +105,15 @@ class _WishboneStreamDMABase(object):
         # are not atomic.
         self._csr_ring_submit = CSRStorage(8, name="ring_submit")
 
-        # This CSR is used by the CPU to stop DMA operation and reset the buffer position
-        # to zero. The CPU writes 1 into it and then waits until ring_count (see above)
-        # is zero. The driver must do this at initialization if there is any possiblilty
-        # that the DMA is in a non-reset state.
-        self._csr_soft_reset = CSRStorage(1, name="soft_reset")
-
         # Signal definitions and logic start here.
 
-        # General status register logic.
+        # General status register logic and component signals.
         self._stat_err = Signal(1)
-        self.comb += self._csr_stat.status.eq(self._stat_err)
+        self._stat_soft_reset = Signal(1)
+        self.comb += [
+            self._csr_stat.status[0].eq(self._stat_err),
+            self._csr_stat.status[1].eq(self._stat_soft_reset,
+        ]
 
         # Signal which is comb-assigned to indicate when a soft reset is actually being
         # done. It is used to reset _ring_count and also allows the derived class to reset
@@ -142,24 +146,21 @@ class _WishboneStreamDMABase(object):
             _ring_count_dec.eq(0)
         ]
 
-        # This signal is uses to latch a soft reset request.
-        self._latch_soft_reset = Signal(1)
+        # Logic for updating _csr_ring_count.
         self.sync += [
-            If(self._csr_soft_reset.re,
-                self._latch_soft_reset.eq(1)
-            )
-        ]
-
-        # Implementation of _csr_ring_count_update and _csr_ring_count_value. The value
-        # of _csr_ring_count_value is updated the the actual _ring_count when 
-        # _csr_ring_count_update is written.
-        self.sync += [
-            If(self._csr_ring_count_update.re,
-                self._csr_ring_count_value.status.eq(self._ring_count)
+            If(self._csr_ctrl.re and self._csr_ctrl.storage[0],
+                self._csr_ring_count.status.eq(self._ring_count)
             )
         ]
         
-        # Implementation of the ring_submit CSR. If a value is being written to
+        # Latch a soft reset request.
+        self.sync += [
+            If(self._csr_ctrl.re and self._csr_ctrl.storage[1],
+                self._stat_soft_reset.eq(1)
+            )
+        ]
+
+        # Implementation of _csr_ring_submit. If a value is being written to
         # csr_ring_submit then increment ring_count by the written value.
         self.comb += [
             If(self._csr_ring_submit.re,
@@ -217,14 +218,14 @@ class _WishboneStreamDMABase(object):
 
         fsm.act("WAIT_BUFFER",
             # If soft reset is needed, do it.
-            If(self._latch_soft_reset,
+            If(self._stat_soft_reset,
                 # Set _doing_soft_reset to reset _ring_count and also let the derived
                 # class reset its own states.
                 self._doing_soft_reset.eq(1),
                 # Reset _ring_pos.
                 NextValue(self._ring_pos, 0),
-                # Clear _latch_soft_reset now that we have done the soft reset.
-                NextValue(self._latch_soft_reset, 0)
+                # Clear _stat_soft_reset now that we have done the soft reset.
+                NextValue(self._stat_soft_reset, 0)
             )
             # If we have a buffer available, prepare some things and continue.
             # We must take into account the current _ring_count_dec because a decrement
@@ -309,7 +310,7 @@ class _WishboneStreamDMABase(object):
         #   this class will decrement _ring_count by one, not the derived class.
         # - ERROR: If there was an error. It does not matter whether _ring_count was
         #   decremented.
-        # - When _latch_soft_reset is active, transition directly to WAIT_BUFFER is
+        # - When _stat_soft_reset is active, transition directly to WAIT_BUFFER is
         #   allowed, where the soft reset will be done.
 
         # By the time the derived class returns control to 
@@ -341,7 +342,7 @@ class _WishboneStreamDMABase(object):
             self._stat_err.eq(1),
             # Stay here waiting for soft reset. Once found, just go to WAIT_BUFFER where
             # it will actually be handled.
-            If(self._latch_soft_reset,
+            If(self._stat_soft_reset,
                 NextState("WAIT_BUFFER")
             )
         )
@@ -426,7 +427,7 @@ class WishboneStreamDMARead(Module, AutoCSR, _WishboneStreamDMABase):
             source.payload.data.eq(data_word),
             source.payload.last_be.eq(last_be),
             source.payload.error.eq(0),
-            If(self._latch_soft_reset,
+            If(self._stat_soft_reset,
                 NextState("WAIT_BUFFER")
             )
             .Elif(source.ready,
