@@ -82,6 +82,10 @@ class _WishboneStreamDMABase(object):
         # Buffer descriptor size in Wishbone words.
         desc_size_words = 64 // wb_data_width
 
+        # General status register.
+        #   bit 0: Error state. Do soft reset to restart (see soft_reset).
+        self._csr_stat = CSRStatus(8, name='stat')
+
         # These registers allow the CPU to determine the current number of buffers that
         # the DMA owns (i.e. buffers to be transmitted or filled with received data).
         # The CPU first writes 1 to ring_count_update and then reads ring_count_value.
@@ -102,6 +106,10 @@ class _WishboneStreamDMABase(object):
         self._csr_soft_reset = CSRStorage(1, name="soft_reset")
 
         # Signal definitions and logic start here.
+
+        # General status register logic.
+        self._stat_err = Signal(1)
+        self.comb += self._csr_stat.status.eq(self._stat_err)
 
         # Signal which is comb-assigned to indicate when a soft reset is actually being
         # done. It is used to reset _ring_count and also allows the derived class to reset
@@ -321,6 +329,8 @@ class _WishboneStreamDMABase(object):
         )
 
         fsm.act("ERROR",
+            # Error bit in _csr_stat is active in this state.
+            self._stat_err.eq(1),
             # Stay here waiting for soft reset. Once found, just go to WAIT_BUFFER where
             # it will actually be handled.
             If(self._latch_soft_reset,
