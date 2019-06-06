@@ -127,8 +127,9 @@ class _WishboneStreamDMABase(object):
         #   was transmitted or filled with data), _ring_count is decremented by 1.
         self._ring_count = Signal(buffer_index_bits)
 
-        # Logic of for updating _ring_count. The _ring_count_inc and _ring_count_dec are
-        # comb-assigned in other logic.
+        # Logic of for updating _ring_count. _ring_count_inc is comb-assigned in other
+        # logic, while _ring_count_dec is sync-assigned to 1 in other logic and is cleared
+        # automatically in the next cycle.
         self._ring_count_inc = Signal(8)
         self._ring_count_dec = Signal(1)
         self.sync += [
@@ -137,7 +138,8 @@ class _WishboneStreamDMABase(object):
             ).Else(
                 self._ring_count.eq(
                     self._ring_count + self._ring_count_inc - self._ring_count_dec)
-            )
+            ),
+            _ring_count_dec.eq(0)
         ]
 
         # This signal is uses to latch a soft reset request.
@@ -225,7 +227,9 @@ class _WishboneStreamDMABase(object):
                 NextValue(self._latch_soft_reset, 0)
             )
             # If we have a buffer available, prepare some things and continue.
-            .Elif(self._ring_count > 0,
+            # We must take into account the current _ring_count_dec because a decrement
+            # may have been requested just prior to entry to the WAIT_BUFFER state.
+            .Elif(self._ring_count - self._ring_count_dec > 0,
                 # Calculate the descriptor address based on _csr_ring_addr and _ring_pos.
                 NextValue(desc_addr, desc_addr_calc_sig),
                 If(wb_data_width == 32,
@@ -297,9 +301,18 @@ class _WishboneStreamDMABase(object):
         
         # By going to process_fsm_state we pass control to the derived class.
         # The derived class will eventually transition to one of:
-        # - WRITE_DESC: If it's done and the descriptor should be updated.
-        # - RELEASE_BUFFER: If it's done and the descriptor should not be updated.
-        # - ERROR: If there was an error.
+        # - WAIT_BUFFER: If it's done and the descriptor should not be updated. In this
+        #   case the derived class must decrement _ring_count by one, by sync-assigning
+        #   _ring_count_dec to 1 exactly once. This must be done only after the buffer
+        #   is no longer being used!
+        # - WRITE_DESC: If it's done and the descriptor should be updated. In this case
+        #   this class will decrement _ring_count by one, not the derived class.
+        # - ERROR: If there was an error. It does not matter whether _ring_count was
+        #   decremented.
+        # - When _latch_soft_reset is active, transition directly to WAIT_BUFFER is
+        #   allowed, where the soft reset will be done.
+
+        # By the time the derived class returns control to 
 
         # If the transition was to WRITE_DESC, the base class assigned the value
         # to write to the second word of the descriptor this signal.
@@ -318,14 +331,9 @@ class _WishboneStreamDMABase(object):
                 NextState("ERROR")
             )
             .Elif(wb_master.ack,
-                NextState("RELEASE_BUFFER")
+                NextValue(self._ring_count_dec, 1),
+                NextState("WAIT_BUFFER")
             )
-        )
-
-        fsm.act("RELEASE_BUFFER",
-            # Decrement _ring_count by one.
-            self._ring_count_dec.eq(1),
-            NextState("WAIT_BUFFER")
         )
 
         fsm.act("ERROR",
@@ -377,7 +385,8 @@ class WishboneStreamDMARead(Module, AutoCSR, _WishboneStreamDMABase):
 
         fsm.act("CHECK_BUF_POS",
             If(self._buffer_data_size == 0,
-                NextState("RELEASE_BUFFER")
+                NextValue(self._ring_count_dec, 1),
+                NextState("WAIT_BUFFER")
             ).Else(
                 If(self._buffer_data_size <= wb_data_width_bytes,
                     NextValue(self._buffer_data_size, 0),
