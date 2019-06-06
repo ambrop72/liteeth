@@ -351,7 +351,7 @@ class _WishboneStreamDMABase(object):
 class WishboneStreamDMARead(Module, AutoCSR, _WishboneStreamDMABase):
     def __init__(self, stream_desc, wb_data_width=32, wb_adr_width=30):
         _WishboneStreamDMABase.__init__(
-            self, stream_desc, wb_data_width, wb_adr_width, "CHECK_BUF_POS")
+            self, stream_desc, wb_data_width, wb_adr_width, "DMA_READ_PIPELINE")
 
         source = stream.Endpoint(stream_desc)
         self.source = source
@@ -359,82 +359,128 @@ class WishboneStreamDMARead(Module, AutoCSR, _WishboneStreamDMABase):
         fsm = self.fsm
         wb_master = self.wb_master
 
-        self.comb += [
-            source.valid.eq(0),
-        ]
-
         wb_data_width_bytes = wb_data_width // 8
 
-        # This signal indicated whether the next data word will start a new packet. It
+        # This signal is used to communicate an error in the pipeline to the driving
+        # FSM state DMA_READ_PIPELINE.
+        wb_error = Signal(1)
+
+        # Pipeline stage 1: check the remaining number of bytes and calculate a bunch
+        # of stuff needed in further stages.
+        p1_ready = Signal(1)
+        p1_valid = Signal(1)
+        p1_buffer_addr = Signal(wb_adr_width)
+        p1_data_sel = Signal(wb_data_width_bytes)
+        p1_last_be = Signal(wb_data_width_bytes)
+        p1_last_word_in_packet = Signal(1)
+
+        # Clear p1_valid when data is tranferred if there is no next data. When there
+        # is next data this assignment is overridden in code below.
+        self.sync += If(p1_valid and p1_ready, p1_valid.eq(0))
+
+        fsm.act("DMA_READ_PIPELINE",
+            If(wb_error,
+                # Wishbone read error, handle by going to ERROR state. There is no need
+                # sync with the pipeline because the reading is done right in the next
+                # pipeline stage and after a read error the data is accepted (i.e.
+                # p1_ready must also be true here).
+                NextState("ERROR")
+            )
+            .Elif(self._buffer_data_size == 0,
+                # Before we can continue we need to make sure that the next pipeline
+                # stage is done with reading from this buffer. But it is simple, just
+                # check p1_valid.
+                If(not p1_valid,
+                    # We're done, make sure the _ring_count is decremented and continue
+                    # with the next buffers.
+                    NextValue(self._ring_count_dec, 1),
+                    NextState("WAIT_BUFFER")
+                )
+            ).
+            Else(
+                # Generate data for the next pipeline stage.
+                If(not p1_valid or p1_ready,
+                    NextValue(p1_valid, 1),
+                    NextValue(p1_buffer_addr, self._buffer_addr),
+                    NextValue(self._buffer_addr, self._buffer_addr + 1),
+                    If(self._buffer_data_size <= wb_data_width_bytes,
+                        NextValue(self._buffer_data_size, 0),
+                        NextValue(p1_data_sel, (1 << self._buffer_data_size) - 1),
+                        NextValue(p1_last_be, 1 << (self._buffer_data_size - 1)),
+                        NextValue(p1_last_word_in_packet, self._buffer_last)
+                    ).Else(
+                        NextValue(self._buffer_data_size, self._buffer_data_size - wb_data_width_bytes),
+                        NextValue(p1_data_sel, (1 << wb_data_width_bytes) - 1),
+                        NextValue(p1_last_be, 0),
+                        NextValue(p1_last_word_in_packet, 0)
+                    )
+                )
+            )
+        )
+
+        # Pipeline stage 2: Read the data word from Wishbone.
+        p2_ready = Signal(1)
+        p2_valid = Signal(1)
+        p2_last_be = Signal(wb_data_width_bytes)
+        p2_last_word_in_packet = Signal(1)
+        p2_data = Signal(wb_data_width)
+
+        self.sync += If(p2_valid and p2_ready, p2_valid.eq(0))
+
+        self.comb += [
+            If(p1_valid and (not p2_valid or p2_ready),
+                wb_master.adr.eq(p1_buffer_addr),
+                wb_master.sel.eq(p1_data_sel),
+                wb_master.cyc.eq(1),
+                wb_master.stb.eq(1),
+                wb_master.we.eq(0),
+                If(wb_master.err,
+                    wb_error.eq(1)
+                ),
+                If(wb_master.err or wb_master.ack,
+                    p1_ready.eq(1)
+                )
+            )
+        ]
+        self.sync += [
+            If(p1_valid and (not p2_valid or p2_ready),
+                If(wb_master.ack,
+                    p2_valid.eq(1),
+                    p2_last_be.eq(p1_last_be),
+                    p2_last_word_in_packet.eq(p1_last_word_in_packet),
+                    p2_data.eq(wb_master.dat_r)
+                )
+            )
+        ]
+
+        # Finally connect the output of the last stage with the stream. The only
+        # nontrivial thing is generation of source.first.
+
+        # This signal indicates whether the next data word will start a new packet. It
         # is a state that persists across processing of individual buffers.
         first_word_in_packet = Signal(1, reset=1)
 
+        # Logic for first_word_in_packet.
         self.sync += [
-            # Reset first_word_in_packet to 1 at soft reset.
+            # Reset to 1 at soft reset.
             If(self._doing_soft_reset,
                 first_word_in_packet.eq(1)
             )
+            # Update whenever to source transfer occurs.
+            .Elif(p2_valid and p2_ready,
+                first_word_in_packet.eq(p2_last_word_in_packet)
+            )
         ]
 
-        # These are temporary storage during processing of a buffer.
-        data_sel = Signal(wb_data_width_bytes)
-        last_be = Signal(wb_data_width_bytes)
-        last_word_in_packet = Signal(1)
-        data_word = Signal(wb_data_width)
-
-        # TODO: Pipeline these states.
-
-        fsm.act("CHECK_BUF_POS",
-            If(self._buffer_data_size == 0,
-                NextValue(self._ring_count_dec, 1),
-                NextState("WAIT_BUFFER")
-            ).Else(
-                If(self._buffer_data_size <= wb_data_width_bytes,
-                    NextValue(self._buffer_data_size, 0),
-                    NextValue(data_sel, (1 << self._buffer_data_size) - 1),
-                    NextValue(last_be, 1 << (self._buffer_data_size - 1)),
-                    NextValue(last_word_in_packet, self._buffer_last),
-                ).Else(
-                    NextValue(self._buffer_data_size, self._buffer_data_size - wb_data_width_bytes),
-                    NextValue(data_sel, (1 << wb_data_width_bytes) - 1),
-                    NextValue(last_be, 0),
-                    NextValue(last_word_in_packet, 0),
-                ),
-                NextState("READ_DATA_FROM_WB")
-            )
-        )
-
-        fsm.act("READ_DATA_FROM_WB",
-            wb_master.adr.eq(self._buffer_addr),
-            wb_master.sel.eq(data_sel),
-            wb_master.cyc.eq(1),
-            wb_master.stb.eq(1),
-            wb_master.we.eq(0),
-            If(wb_master.err,
-                NextState("ERROR")
-            )
-            .Elif(wb_master.ack,
-                NextValue(data_word, wb_master.dat_r),
-                NextValue(self._buffer_addr, self._buffer_addr + 1),
-                NextState("PASS_DATA_TO_STREAM")
-            )
-        )
-
-        fsm.act("PASS_DATA_TO_STREAM",
-            source.valid.eq(1),
+        self.comb += [
+            p2_ready.eq(source.ready),
+            source.valid.eq(p2_valid),
             source.first.eq(first_word_in_packet),
-            source.last.eq(last_word_in_packet),
-            source.payload.data.eq(data_word),
-            source.payload.last_be.eq(last_be),
-            source.payload.error.eq(0),
-            If(self._stat_soft_reset,
-                NextState("WAIT_BUFFER")
-            )
-            .Elif(source.ready,
-                NextValue(first_word_in_packet, last_word_in_packet),
-                NextState("CHECK_BUF_POS")
-            )
-        )
+            source.last.eq(p2_last_word_in_packet),
+            source.payload.data.eq(p2_data),
+            source.payload.last_be.eq(p2_last_be),
+            source.payload.error.eq(0)
+        ]
 
 
 class WishboneStreamDMAWrite(Module, AutoCSR, _WishboneStreamDMABase):
