@@ -6,6 +6,7 @@ from migen.genlib.fsm import FSM, NextState, NextValue
 
 from litex.soc.interconnect import wishbone, stream
 from litex.soc.interconnect.csr import CSRStorage, CSRStatus, CSRConstant, AutoCSR
+from litex.soc.interconnect.csr_eventmanager import EventManager, EventSourceLevel
 
 from liteeth.core.mac import eth_phy_description
 
@@ -50,7 +51,7 @@ class _WishboneStreamDMABase(object):
         buffer_size_bits = 15
 
         # Define a CSR constant for the required alignment of the ring buffer and data
-        # buffers, so the CPU can be sure to align correctly.
+        # buffers (in bytes), so the CPU can be sure to align correctly.
         self._csr_mem_align = CSRConstant(wb_data_width_bytes, name="mem_align")
 
         # The CPU configures the address and size of the ring buffer containing buffer
@@ -62,10 +63,13 @@ class _WishboneStreamDMABase(object):
 
         # Each element of the ring buffer ("buffer des") has two 32-bit words:
         # First word:
-        #  bits 0-31: The byte address of the buffer.
+        #   bits 0-31: Byte address of the buffer. It must be aligned to _csr_mem_align
+        #     bytes.
         # Second word:
         #   bits 0-14: Buffer size in bytes. Must be a multiple of mem_align.
-        #   bits 15-29: Data size in bytes.
+        #   bits 15-29: Data size in bytes. For TX all data sizes except the last buffer
+        #     in a packet (see bit 31) must be multiples of mem_align. For RX the DMA
+        #     guarantees the same.
         #   bit 30: End-of-packet bit. 0 means the packet continues in the next buffer,
         #     1 means this is the last buffer of the packet.
         #   bit 31: Receive error bit. If there is a 1 in any buffer descriptor for a
@@ -85,6 +89,12 @@ class _WishboneStreamDMABase(object):
         # General status register.
         #   bit 0: Error state. Do soft reset to restart (see _csr_ctrl).
         #   bit 1: Soft reset in progress (see _csr_ctrl).
+        #   bit 2: Interrupt enabled. Default is 0, enable/disable is via _csr_ctrl. If
+        #     enabled, the interrupt is generated and latched whenever the DMA releases a
+        #     buffer that has the end-of-packet bit set or when _ring_count changes from
+        #     non-zero to 0.
+        #   bit 3: Interrupt active. Clear via _csr_ctrl. Disabling the interrupt also
+        #     clears it.
         self._csr_stat = CSRStatus(8, name='stat')
 
         # General control register.
@@ -92,6 +102,10 @@ class _WishboneStreamDMABase(object):
         #   bit 1: Write 1 to perform soft reset. This is needed at initialization to
         #     stop operation and reset _ring_count to zero. After requesting soft reset,
         #     wait until the soft reset bit in _csr_stat is cleared.
+        #   bit 2: Write 1 to enable the interrupt.
+        #   bit 3: Write 1 to disable and clear the interrupt. Disable takes precedence
+        #     over enable, but there is no reason to write with both bits set.
+        #   bit 4: Write 1 to clear the interrupt.
         self._csr_ctrl = CSRStorage(8, name="ctrl")
 
         # This register is used to determine the current number of buffers that the DMA
@@ -110,9 +124,13 @@ class _WishboneStreamDMABase(object):
         # General status register logic and component signals.
         self._stat_err = Signal(1)
         self._stat_soft_reset = Signal(1)
+        self._interrupt_enabled = Signal(1)
+        self._interrupt_active = Signal(1)
         self.comb += [
             self._csr_stat.status[0].eq(self._stat_err),
             self._csr_stat.status[1].eq(self._stat_soft_reset,
+            self._csr_stat.status[2].eq(self._interrupt_enabled),
+            self._csr_stat.status[3].eq(self._interrupt_active),
         ]
 
         # Signal which is comb-assigned to indicate when a soft reset is actually being
@@ -134,16 +152,36 @@ class _WishboneStreamDMABase(object):
         # Logic of for updating _ring_count. _ring_count_inc is comb-assigned in other
         # logic, while _ring_count_dec is sync-assigned to 1 in other logic and is cleared
         # automatically in the next cycle.
+        self._next_ring_count = Signal(buffer_index_bits)
         self._ring_count_inc = Signal(8)
         self._ring_count_dec = Signal(1)
-        self.sync += [
+        self.comb += [
             If(self._doing_soft_reset,
-                self._ring_count.eq(0)
+                self._next_ring_count.eq(0)
             ).Else(
-                self._ring_count.eq(
+                self._next_ring_count.eq(
                     self._ring_count + self._ring_count_inc - self._ring_count_dec)
-            ),
+            )
+        ]
+        self.sync += [
+            self._ring_count.eq(self._next_ring_count),
             _ring_count_dec.eq(0)
+        ]
+
+        # Logic for generating the interrupt when _ring_count becomes 0.
+        self.sync += [
+            If(self._interrupt_enabled and self._ring_count != 0 and self._next_ring_count == 0,
+                self._interrupt_active.eq(1)
+            )
+        ]
+
+        # Partial logic for generating the interrupt when a buffer with the end-of-packet
+        # bit set is released.
+        self._releasing_last_buffer_in_packet = Signal(1)
+        self.sync += [
+            If(self._interrupt_enabled and self._releasing_last_buffer_in_packet,
+                self._interrupt_active.eq(1)
+            )
         ]
 
         # Logic for updating _csr_ring_count.
@@ -167,15 +205,39 @@ class _WishboneStreamDMABase(object):
                 self._ring_count_inc.eq(self._csr_ring_submit.storage)
             )
         ]
+
+        # Logic for enabling and disabling the interrupt.
+        self.sync += [
+            If(self._csr_ctrl.re and self._csr_ctrl.storage[3],
+                self._interrupt_enabled.eq(0)
+            )
+            .Elif(self._csr_ctrl.re and self._csr_ctrl.storage[2],
+                self._interrupt_enabled.eq(1)
+            )
+        ]
+
+        # Logic for clearing the interrupt. Note that this takes precedence over generating
+        # the interrupt, but it shouldn't matter what the behavior is.
+        self.sync += [
+            If(self._csr_ctrl.re and (self._csr_ctrl.storage[3] or self._csr_ctrl.storage[4]),
+                self._interrupt_active.eq(0)
+            )
+        ]
+
+        # Interrupt setup.
+        self.submodules.ev = EventManager()
+        self.ev.interrupt = EventSourceLevel()
+        self.ev.finalize()
+        self.comb += self.ev.interrupt.trigger.eq(self._interrupt_active)
         
         # FSM which does the following in a loop:
         # - Wait for a buffer to be available (WAIT_BUFFER).
         # - Read the buffer descriptor (READ_DESC_1, READ_DESC_2).
-        # - Decode the information from the buffer descriptor.
-        # - Pass control to the derived class do do the DMA read/write and wait
-        #   until it's done (PROCESS_BUFFER).
+        # - Pass control to the derived class to do the DMA read/write and wait
+        #   until it's done.
         # - If necessary, update the buffer descriptor (WRITE_DESC).
-        # - Release the buffer.
+        # - Release the buffer (already done by derived class if not updating
+        #   the buffer descriptor).
 
         fsm = FSM(reset_state="WAIT_BUFFER")
         self.submodules += fsm
@@ -304,10 +366,12 @@ class _WishboneStreamDMABase(object):
         # The derived class will eventually transition to one of:
         # - WAIT_BUFFER: If it's done and the descriptor should not be updated. In this
         #   case the derived class must decrement _ring_count by one, by sync-assigning
-        #   _ring_count_dec to 1 exactly once. This must be done only after the buffer
-        #   is no longer being used!
+        #   _ring_count_dec to 1 exactly once. If the buffer has the end-of-packet bit set
+        #   then _releasing_last_buffer_in_packet must also be sync-assigned to 1 in the
+        #   same cycle. This must be done only after the buffer is no longer being used!
         # - WRITE_DESC: If it's done and the descriptor should be updated. In this case
-        #   this class will decrement _ring_count by one, not the derived class.
+        #   this class will take care of decrementing _ring_count by one and setting
+        #   _releasing_last_buffer_in_packet if needed, not the derived class.
         # - ERROR: If there was an error. It does not matter whether _ring_count was
         #   decremented.
         # - When _stat_soft_reset is active, transition directly to WAIT_BUFFER is
@@ -333,6 +397,10 @@ class _WishboneStreamDMABase(object):
             )
             .Elif(wb_master.ack,
                 NextValue(self._ring_count_dec, 1),
+                # Generate the interrupt for the last buffer in a packet (if enabled).
+                If(self._update_descriptor_value[30], # end-of-packet bit
+                    self._releasing_last_buffer_in_packet.eq(1)
+                ),
                 NextState("WAIT_BUFFER")
             )
         )
@@ -394,6 +462,10 @@ class WishboneStreamDMARead(Module, AutoCSR, _WishboneStreamDMABase):
                     # We're done, make sure the _ring_count is decremented and continue
                     # with the next buffers.
                     NextValue(self._ring_count_dec, 1),
+                    # Generate the interrupt for the last buffer in a packet (if enabled).
+                    If(self._buffer_last, # end-of-packet bit
+                        self._releasing_last_buffer_in_packet.eq(1)
+                    ),
                     NextState("WAIT_BUFFER")
                 )
             ).
