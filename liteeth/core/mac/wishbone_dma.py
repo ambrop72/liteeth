@@ -144,7 +144,7 @@ class _WishboneStreamDMABase(object):
         # Signal definitions and logic start here.
 
         # General status register assignment from component signals.
-        self._stat_err = Signal(1)
+        self._stat_err = Signal(1) # comb-assigned from ERROR state
         self._stat_soft_reset = Signal(1)
         self._interrupt_enabled = Signal(1)
         self._interrupt_active = Signal(1)
@@ -202,12 +202,13 @@ class _WishboneStreamDMABase(object):
 
         # Partial logic for generating the interrupt when a buffer with the end-of-packet
         # bit set is released. _releasing_last_buffer_in_packet is sync-assigned from
-        # other when this happens.
+        # other code when this happens.
         self._releasing_last_buffer_in_packet = Signal(1)
         self.sync += [
             If(self._interrupt_enabled and self._releasing_last_buffer_in_packet,
                 self._interrupt_active.eq(1)
-            )
+            ),
+            self._releasing_last_buffer_in_packet.eq(0) # clear automatically
         ]
 
         # Logic for updating _csr_ring_count when requested by the CPU.
@@ -375,7 +376,7 @@ class _WishboneStreamDMABase(object):
         # - WAIT_BUFFER: If it's done and the descriptor should not be updated. In this
         #   case the derived class must decrement _ring_count by one, by sync-assigning
         #   1 to _ring_count_dec exactly once. If the buffer has the end-of-packet bit set
-        #   then _releasing_last_buffer_in_packet must also be sync-assigned to 1 in the
+        #   then also 1 must be sync-assigned to _releasing_last_buffer_in_packet in the
         #   same cycle. This must be done only after the buffer is no longer being used
         #   by the DMA!
         # - WRITE_DESC: If it's done and the descriptor should be updated. In this case
@@ -410,7 +411,7 @@ class _WishboneStreamDMABase(object):
                 NextValue(self._ring_count_dec, 1),
                 # Generate the interrupt for the last buffer in a packet (if enabled).
                 If(self._update_descriptor_value[30], # end-of-packet bit
-                    self._releasing_last_buffer_in_packet.eq(1)
+                    NextValue(self._releasing_last_buffer_in_packet, 1)
                 ),
                 NextState("WAIT_BUFFER")
             )
@@ -474,7 +475,7 @@ class WishboneStreamDMARead(Module, AutoCSR, _WishboneStreamDMABase):
                     NextValue(self._ring_count_dec, 1),
                     # Generate the interrupt for the last buffer in a packet (if enabled).
                     If(self._buffer_last, # end-of-packet bit
-                        self._releasing_last_buffer_in_packet.eq(1)
+                        NextValue(self._releasing_last_buffer_in_packet, 1)
                     ),
                     NextState("WAIT_BUFFER")
                 )
