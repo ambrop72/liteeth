@@ -11,13 +11,21 @@ from litex.soc.interconnect.csr_eventmanager import EventManager, EventSourceLev
 from liteeth.core.mac import eth_phy_description
 
 
-def _get_stream_data_width(stream_desc):
-    for field in stream_desc.payload_layout:
-        if field[0] == "data":
-            if not isinstance(field[1], int):
-                raise ValueError("data field in payload layout does not have an integer width")
-            return field[1]
-    raise ValueError("missing data field in payload layout")
+def _check_stream_and_get_data_width(stream_desc):
+    payload_fields = dict((field[0], field) for field in stream_desc.payload_layout)
+
+    if "data" not in payload_fields:
+        raise ValueError("missing data field in payload layout")
+    if not isinstance(payload_fields["data"][1], int):
+        raise ValueError("data field in payload layout does not have integer width")
+    
+    if "last_be" not in payload_fields:
+        raise ValueError("missing last_be field in payload layout")
+
+    if "error" not in payload_fields:
+        raise ValueError("missing error field in payload layout")
+
+    return payload_fields["data"][1]
 
 
 class _WishboneStreamDMABase(object):
@@ -33,7 +41,7 @@ class _WishboneStreamDMABase(object):
 
         # Figure out the data width of the stream from the StreamDescriptor. We require
         # that there is a "data" field in the payload structure.
-        self._stream_data_width = _get_stream_data_width(stream_desc)
+        self._stream_data_width = _check_stream_and_get_data_width(stream_desc)
 
         # There is no support for data width mismatch between WB and stream for now.
         assert self._stream_data_width == wb_data_width
@@ -549,9 +557,9 @@ class WishboneStreamDMARead(Module, AutoCSR, _WishboneStreamDMABase):
             source.valid.eq(p2_valid),
             source.first.eq(first_word_in_packet),
             source.last.eq(p2_last_word_in_packet),
-            source.payload.data.eq(p2_data),
-            source.payload.last_be.eq(p2_last_be),
-            source.payload.error.eq(0)
+            source.data.eq(p2_data),
+            source.last_be.eq(p2_last_be),
+            source.error.eq(0)
         ]
 
 
