@@ -30,17 +30,14 @@ def _check_stream_and_get_data_width(stream_desc):
 
 class _WishboneStreamDMABase(object):
     def __init__(self, stream_desc, wb_data_width, wb_adr_width, process_fsm_state):
-        # We support only 32-bit or 64-bit wishbone data width, and only 30-bit address
-        # width.
+        # We support only 32-bit or 64-bit wishbone data width.
         assert wb_data_width in (32, 64)
-        assert wb_adr_width == 30
 
         # Create the Wishbone interface used to access the memory.
         wb_master = wishbone.Interface(wb_data_width, wb_adr_width)
         self.wb_master = wb_master
 
-        # Figure out the data width of the stream from the StreamDescriptor. We require
-        # that there is a "data" field in the payload structure.
+        # Figure out the data width of the stream from the StreamDescriptor.
         self._stream_data_width = _check_stream_and_get_data_width(stream_desc)
 
         # There is no support for data width mismatch between WB and stream for now.
@@ -49,66 +46,80 @@ class _WishboneStreamDMABase(object):
         # Wishbone data width in bytes and corresponding number of address bits in byte
         # addresses (number of bits to strip to get from byte to WB address).
         wb_data_width_bytes = wb_data_width // 8
+        self._wb_data_width_bytes = wb_data_width_bytes
         wb_data_width_addr_bits = int(log2(wb_data_width_bytes))
 
+        # We support only WB address width equivalent to 32-bit byte address.
+        assert wb_adr_width == 32 - wb_data_width_addr_bits
+
         # Number of bits for representing buffer counts and indices (16 bits allows at
-        # most 65535 buffers).
+        # most 65535 buffers). This can be changed without much concern.
         buffer_index_bits = 16
 
-        # Number of bits for representing buffer sizes in bytes.
-        buffer_size_bits = 15
+        # Number of bits for representing buffer sizes in bytes (14 bits allows jumbo
+        # frames with MTU 9000). This must not be more than 15 because then we run out of
+        # bits in the buffer descriptor!
+        buffer_size_bits = 14
+        assert buffer_size_bits <= 15
 
-        # Define a CSR constant for the required alignment of the ring buffer and data
-        # buffers (in bytes), so the CPU can be sure to align correctly.
+        # CSR constant for the required alignment (in bytes) of the descriptors ring buffer
+        # and data buffers, so the CPU can be sure to align correctly.
         self._csr_mem_align = CSRConstant(wb_data_width_bytes, name="mem_align")
 
         # The CPU configures the address and size of the ring buffer containing buffer
-        # descriptors (see below) by writing values into these registers. ring_addr
-        # is the byte address and ring_size_m1 is the number of buffer descriptors minus
-        # one. This must not be changed after the CPU has pushed any buffer to the DMA.
+        # descriptors (see below) by writing values into these registers. _csr_ring_addr
+        # is the byte address and _csr_ring_size_m1 is the number of buffer descriptors
+        # minus one. This must not be changed while the DMA is responsible for any buffers
+        # (_ring_count > 0).
         self._csr_ring_addr = CSRStorage(32, name="ring_addr")
         self._csr_ring_size_m1 = CSRStorage(buffer_index_bits, name="ring_size_m1")
 
-        # Each element of the ring buffer ("buffer des") has two 32-bit words:
+        # Each buffer descriptor in the ring buffer is made of two 32-bit words:
         # First word:
-        #   bits 0-31: Byte address of the buffer. It must be aligned to _csr_mem_align
+        #   bits 0..31: Byte address of the buffer. It must be aligned to _csr_mem_align
         #     bytes.
         # Second word:
-        #   bits 0-14: Buffer size in bytes. Must be a multiple of mem_align.
-        #   bits 15-29: Data size in bytes. For TX all data sizes except the last buffer
-        #     in a packet (see bit 31) must be multiples of mem_align. For RX the DMA
-        #     guarantees the same.
+        #   bits 0..14: Buffer size (in bytes). It must be set by the CPU and mut be a
+        #     multiple of mem_align. Currently only used for RX but should also be set
+        #     meaningfully for TX.
+        #   bits 15..29: Data size (in bytes). For TX this must be set by the CPU, and all
+        #     data sizes except for the last buffer in a packet (see bit 31) must be
+        #     multiples of _csr_mem_align. For RX the DMA sets this before the buffer is
+        #     returned to the CPU, and for all but the last buffer in a packet it will be a
+        #     multiple of _csr_mem_align.
         #   bit 30: End-of-packet bit. 0 means the packet continues in the next buffer,
-        #     1 means this is the last buffer of the packet.
-        #   bit 31: Receive error bit. If there is a 1 in any buffer descriptor for a
+        #     1 means this is the last buffer in the packet. For TX it must be set by the
+        #     CPU, for RX the DMA sets this before the buffer is returned to the CPU.
+        #   bit 31: Receive error bit. For RX, if this is 1 in any buffer descriptor of a
         #     received packet then the packet is incomplete and should not processed.
-        #     Unused for transmission.
-        #
-        # Data size and end-of-packet bit are updated:
-        # - For write DMA, by the CPU before it submits the buffer to the DMA.
-        # - For read DMA, by the DMA before it releases the buffer to the CPU.
+        #     Unused for TX.
         #
         # If the wishbone data width is 64-bit then "first word" are the low-order bits
         # and "second word" the high-order bits (i.e. little endian interpretation).
+        #
+        # The CPU must correctly set the entire descriptor before submitting the buffer
+        # to the DMA. For RX, the DMA also updates the descriptor before returning the
+        # buffer to the CPU. In any case, the DMA does not read any descriptor before the
+        # buffer is submitted.
 
-        # Buffer descriptor size in Wishbone words.
+        # Buffer descriptor size in Wishbone words (1 or 2).
         desc_size_words = 64 // wb_data_width
 
         # General status register.
-        #   bit 0: Error state. Do soft reset to restart (see _csr_ctrl).
+        #   bit 0: Error state, DMA is stopped. Do soft reset to restart (see _csr_ctrl).
         #   bit 1: Soft reset in progress (see _csr_ctrl).
         #   bit 2: Interrupt enabled. Default is 0, enable/disable is via _csr_ctrl. If
         #     enabled, the interrupt is generated and latched whenever the DMA releases a
-        #     buffer that has the end-of-packet bit set or when _ring_count changes from
-        #     non-zero to 0.
+        #     buffer that has the end-of-packet bit set (i.e. packet transmitted/received)
+        #     or when _ring_count changes from non-zero to 0.
         #   bit 3: Interrupt active. Clear via _csr_ctrl. Disabling the interrupt also
         #     clears it.
         self._csr_stat = CSRStatus(8, name='stat')
 
         # General control register.
         #   bit 0: Write 1 to refresh _csr_ring_count (see the comment there).
-        #   bit 1: Write 1 to perform soft reset. This is needed at initialization to
-        #     stop operation and reset _ring_count to zero. After requesting soft reset,
+        #   bit 1: Write 1 to perform a soft reset. This is needed at initialization to
+        #     stop operation and reset the buffer states. After requesting soft reset,
         #     wait until the soft reset bit in _csr_stat is cleared.
         #   bit 2: Write 1 to enable the interrupt.
         #   bit 3: Write 1 to disable and clear the interrupt. Disable takes precedence
@@ -118,25 +129,28 @@ class _WishboneStreamDMABase(object):
 
         # This register is used to determine the current number of buffers that the DMA
         # owns (buffers to be transmitted or filled with received data). It is updated
-        # only when the CPU writes 1 to bit 0 in _csr_ctrl.
+        # to the current value of _ring_count only when the CPU requests the update via
+        # _csr_ctrl (to allow atomic read).
         self._csr_ring_count = CSRStatus(buffer_index_bits, name="ring_count")
 
         # The CPU writes to this register to submit a number of buffers (the written
         # number) to the DMA. Due to its width at most 255 buffers can be submitted with
         # one register write. It must not be wider than 8 bits because then CSR writes
-        # are not atomic.
+        # are not atomic. Note that for TX, all buffers making up a packet must be
+        # submitted as part of one write to this register, else there is a risk of FIFO
+        # underrun.
         self._csr_ring_submit = CSRStorage(8, name="ring_submit")
 
         # Signal definitions and logic start here.
 
-        # General status register logic and component signals.
+        # General status register assignment from component signals.
         self._stat_err = Signal(1)
         self._stat_soft_reset = Signal(1)
         self._interrupt_enabled = Signal(1)
         self._interrupt_active = Signal(1)
         self.comb += [
             self._csr_stat.status[0].eq(self._stat_err),
-            self._csr_stat.status[1].eq(self._stat_soft_reset,
+            self._csr_stat.status[1].eq(self._stat_soft_reset),
             self._csr_stat.status[2].eq(self._interrupt_enabled),
             self._csr_stat.status[3].eq(self._interrupt_active),
         ]
@@ -146,23 +160,26 @@ class _WishboneStreamDMABase(object):
         # its own states at that time.
         self._doing_soft_reset = Signal(1)
 
-        # The _ring_pos is the index of the first buffer that the DMA owns.
+        # The _ring_pos is the index of the first buffer that the DMA owns. It is reset to
+        # 0 at soft reset and is incremented by one each time the DMA starts processing a
+        # buffer, wrapping around to 0 after _csr_ring_size_m1.
         self._ring_pos = Signal(buffer_index_bits)
 
         # _ring_count is the current number of buffers that the DMA owns.
         # This number is managed as follows:
+        # - It is reset to 0 at soft reset.
         # - When buffers is submitted to the DMA (_csr_ring_submit is written), _ring_count
         #   is incremented by the numbers of submitted buffers.
-        # - When a previously submitted buffer is done being processed by the DMA (i.e.
-        #   was transmitted or filled with data), _ring_count is decremented by 1.
+        # - When a previously submitted buffer is released to the CPU (after being
+        #   transmiitted or filled with received data), _ring_count is decremented by 1.
         self._ring_count = Signal(buffer_index_bits)
 
-        # Logic of for updating _ring_count. _ring_count_inc is comb-assigned in other
-        # logic, while _ring_count_dec is sync-assigned to 1 in other logic and is cleared
+        # Logic for updating _ring_count. _ring_count_inc is comb-assigned in other logic,
+        # while _ring_count_dec is sync-assigned to 1 in other logic and is cleared
         # automatically in the next cycle.
-        self._next_ring_count = Signal(buffer_index_bits)
         self._ring_count_inc = Signal(8)
         self._ring_count_dec = Signal(1)
+        self._next_ring_count = Signal(buffer_index_bits)
         self.comb += [
             If(self._doing_soft_reset,
                 self._next_ring_count.eq(0)
@@ -173,7 +190,7 @@ class _WishboneStreamDMABase(object):
         ]
         self.sync += [
             self._ring_count.eq(self._next_ring_count),
-            _ring_count_dec.eq(0)
+            self._ring_count_dec.eq(0)
         ]
 
         # Logic for generating the interrupt when _ring_count becomes 0.
@@ -184,7 +201,8 @@ class _WishboneStreamDMABase(object):
         ]
 
         # Partial logic for generating the interrupt when a buffer with the end-of-packet
-        # bit set is released.
+        # bit set is released. _releasing_last_buffer_in_packet is sync-assigned from
+        # other when this happens.
         self._releasing_last_buffer_in_packet = Signal(1)
         self.sync += [
             If(self._interrupt_enabled and self._releasing_last_buffer_in_packet,
@@ -192,7 +210,7 @@ class _WishboneStreamDMABase(object):
             )
         ]
 
-        # Logic for updating _csr_ring_count.
+        # Logic for updating _csr_ring_count when requested by the CPU.
         self.sync += [
             If(self._csr_ctrl.re and self._csr_ctrl.storage[0],
                 self._csr_ring_count.status.eq(self._ring_count)
@@ -207,19 +225,21 @@ class _WishboneStreamDMABase(object):
         ]
 
         # Implementation of _csr_ring_submit. If a value is being written to
-        # csr_ring_submit then increment ring_count by the written value.
+        # _csr_ring_submit then increment _ring_count by the written value.
         self.comb += [
             If(self._csr_ring_submit.re,
                 self._ring_count_inc.eq(self._csr_ring_submit.storage)
             )
         ]
 
-        # Logic for enabling and disabling the interrupt.
+        # Logic for enabling and disabling the interrupt via _csr_ctrl.
         self.sync += [
             If(self._csr_ctrl.re and self._csr_ctrl.storage[3],
+                # Disable the interrupt.
                 self._interrupt_enabled.eq(0)
             )
             .Elif(self._csr_ctrl.re and self._csr_ctrl.storage[2],
+                # Enable the interrupt.
                 self._interrupt_enabled.eq(1)
             )
         ]
@@ -242,33 +262,20 @@ class _WishboneStreamDMABase(object):
         # - Wait for a buffer to be available (WAIT_BUFFER).
         # - Read the buffer descriptor (READ_DESC_1, READ_DESC_2).
         # - Pass control to the derived class to do the DMA read/write and wait
-        #   until it's done.
+        #   until it's done (process_fsm_state).
         # - If necessary, update the buffer descriptor (WRITE_DESC).
         # - Release the buffer (already done by derived class if not updating
         #   the buffer descriptor).
 
         fsm = FSM(reset_state="WAIT_BUFFER")
-        self.submodules += fsm
-
-        # Default Wishbone outputs.
-        self.comb += [
-            wb_master.adr.eq(0),
-            wb_master.dat_w.eq(0),
-            wb_master.sel.eq(0),
-            wb_master.cyc.eq(0),
-            wb_master.stb.eq(0),
-            wb_master.we.eq(0),
-            wb_master.cti.eq(0),
-            wb_master.bte.eq(0),
-        ]
+        self.submodules.fsm = fsm
 
         # Temporary storage for the descriptor address.
         desc_addr = Signal(wb_adr_width)
-        if wb_data_width == 32:
-            desc_addr2 = Signal(wb_adr_width)
 
-        # The following are set here based on the descriptor. They can be read from the
-        # processing code in the deriver class and also updated during processing.
+        # The following are set based on the descriptor. They can be read from the
+        # processing code in the derived class and also updated during processing
+        # (updating does not change the behavior of the base class).
         # - Buffer address for Wishbone (not byte address).
         # - Buffer size in bytes.
         # - Data size in bytes.
@@ -278,19 +285,11 @@ class _WishboneStreamDMABase(object):
         self._buffer_data_size = Signal(buffer_size_bits)
         self._buffer_last = Signal(1)
 
-        # Comb-defined signal for calculating the descriptor address to avoid
-        # duplicatication when we need the +1 address.
-        desc_addr_calc_sig = Signal(wb_adr_width)
-        self.comb += desc_addr_calc_sig.eq(
-            (self._csr_ring_addr.storage >> wb_data_width_addr_bits) +
-            self._ring_pos * desc_size_words
-        )
-
         fsm.act("WAIT_BUFFER",
             # If soft reset is needed, do it.
             If(self._stat_soft_reset,
-                # Set _doing_soft_reset to reset _ring_count and also let the derived
-                # class reset its own states.
+                # Set _doing_soft_reset in order to reset _ring_count and also let the
+                # derived class reset its own states.
                 self._doing_soft_reset.eq(1),
                 # Reset _ring_pos.
                 NextValue(self._ring_pos, 0),
@@ -302,36 +301,36 @@ class _WishboneStreamDMABase(object):
             # may have been requested just prior to entry to the WAIT_BUFFER state.
             .Elif(self._ring_count - self._ring_count_dec > 0,
                 # Calculate the descriptor address based on _csr_ring_addr and _ring_pos.
-                NextValue(desc_addr, desc_addr_calc_sig),
-                If(wb_data_width == 32,
-                    NextValue(desc_addr2, desc_addr_calc_sig + 1)
-                ),
+                NextValue(desc_addr,
+                    self._csr_ring_addr.storage[wb_data_width_addr_bits:] +
+                    self._ring_pos * desc_size_words),
                 # Increment _ring_pos by one (with wrap-around).
                 If(self._ring_pos == self._csr_ring_size_m1.storage,
                     NextValue(self._ring_pos, 0)
                 ).Else(
                     NextValue(self._ring_pos, self._ring_pos + 1)
                 ),
+                # Continue reading the buffer descriptor.
                 NextState("READ_DESC_1")
             )
         )
 
         def save_desc_first_word(desc_first_word):
             return [
-                NextValue(self._buffer_addr, desc_first_word >> wb_data_width_addr_bits),
+                NextValue(self._buffer_addr, desc_first_word[wb_data_width_addr_bits:]),
             ]
 
         def save_desc_second_word(desc_second_word):
             return [
-                NextValue(self._buffer_size, desc_second_word & 0x7FFF),
-                NextValue(self._buffer_data_size, (desc_second_word >> 15) & 0x7FFF),
-                NextValue(self._buffer_last, (desc_second_word >> 30) & 1),
+                NextValue(self._buffer_size, desc_second_word[0:buffer_size_bits]),
+                NextValue(self._buffer_data_size, desc_second_word[15:15+buffer_size_bits]),
+                NextValue(self._buffer_last, desc_second_word[30]),
             ]
 
         fsm.act("READ_DESC_1",
             # Read the descriptor (first word or complete).
             wb_master.adr.eq(desc_addr),
-            wb_master.sel.eq((1 << wb_data_width_bytes) - 1)
+            wb_master.sel.eq((1 << wb_data_width_bytes) - 1),
             wb_master.cyc.eq(1),
             wb_master.stb.eq(1),
             wb_master.we.eq(0),
@@ -340,13 +339,14 @@ class _WishboneStreamDMABase(object):
             )
             .Elif(wb_master.ack,
                 If(wb_data_width == 32,
-                    # Store the first word, read the second word now.
+                    # Store the first word, continue reading the second word.
                     *save_desc_first_word(wb_master.dat_r),
+                    NextValue(desc_addr, desc_addr + 1),
                     NextState("READ_DESC_2")
                 ).Else(
-                    # Got the entire descriptor, store it and continug processing.
-                    *save_desc_first_word(wb_master.dat_r & 0xFFFFFFFF),
-                    *save_desc_second_word(wb_master.dat_r >> 32),
+                    # Store the descriptor and continue processing in the derived class.
+                    *save_desc_first_word(wb_master.dat_r[0:32]),
+                    *save_desc_second_word(wb_master.dat_r[32:64]),
                     NextState(process_fsm_state)
                 )
             )
@@ -355,7 +355,7 @@ class _WishboneStreamDMABase(object):
         if wb_data_width == 32:
             # Read the second word of the descriptor.
             fsm.act("READ_DESC_2",
-                wb_master.adr.eq(desc_addr2),
+                wb_master.adr.eq(desc_addr),
                 wb_master.sel.eq((1 << wb_data_width_bytes) - 1),
                 wb_master.cyc.eq(1),
                 wb_master.stb.eq(1),
@@ -364,34 +364,36 @@ class _WishboneStreamDMABase(object):
                     NextState("ERROR")
                 )
                 .Elif(wb_master.ack,
-                    # Store the second word and continug processing.
+                    # Store the second word aand continue processing in the derived class.
                     *save_desc_second_word(wb_master.dat_r),
                     NextState(process_fsm_state)
                 )
             )
         
-        # By going to process_fsm_state we pass control to the derived class.
+        # By going into process_fsm_state we pass control to the derived class.
         # The derived class will eventually transition to one of:
         # - WAIT_BUFFER: If it's done and the descriptor should not be updated. In this
         #   case the derived class must decrement _ring_count by one, by sync-assigning
-        #   _ring_count_dec to 1 exactly once. If the buffer has the end-of-packet bit set
+        #   1 to _ring_count_dec exactly once. If the buffer has the end-of-packet bit set
         #   then _releasing_last_buffer_in_packet must also be sync-assigned to 1 in the
-        #   same cycle. This must be done only after the buffer is no longer being used!
+        #   same cycle. This must be done only after the buffer is no longer being used
+        #   by the DMA!
         # - WRITE_DESC: If it's done and the descriptor should be updated. In this case
         #   this class will take care of decrementing _ring_count by one and setting
         #   _releasing_last_buffer_in_packet if needed, not the derived class.
-        # - ERROR: If there was an error. It does not matter whether _ring_count was
+        # - ERROR: If there was an error. It does not matter whether the _ring_count was
         #   decremented.
         # - When _stat_soft_reset is active, transition directly to WAIT_BUFFER is
         #   allowed, where the soft reset will be done.
 
-        # By the time the derived class returns control to 
-
-        # If the transition was to WRITE_DESC, the base class assigned the value
-        # to write to the second word of the descriptor this signal.
+        # If the transition was to WRITE_DESC, the base class assigns the value to
+        # be written to the second word of the descriptor to this signal.
         self._update_descriptor_value = Signal(32)
 
         fsm.act("WRITE_DESC",
+            # If wb_data_width == 32 then desc_addr is the address of the second
+            # word of the descriptor (it was incremented by 1 at entry to READ_DESC_2).
+            # If wb_data_width == 64 then desc_addr is the original descriptor address.
             wb_master.adr.eq(desc_addr),
             wb_master.dat_w.eq(
                 self._update_descriptor_value if wb_data_width == 32
@@ -404,6 +406,7 @@ class _WishboneStreamDMABase(object):
                 NextState("ERROR")
             )
             .Elif(wb_master.ack,
+                # Decrement _ring_count by 1, in the next cycle.
                 NextValue(self._ring_count_dec, 1),
                 # Generate the interrupt for the last buffer in a packet (if enabled).
                 If(self._update_descriptor_value[30], # end-of-packet bit
@@ -434,8 +437,7 @@ class WishboneStreamDMARead(Module, AutoCSR, _WishboneStreamDMABase):
 
         fsm = self.fsm
         wb_master = self.wb_master
-
-        wb_data_width_bytes = wb_data_width // 8
+        wb_data_width_bytes = self._wb_data_width_bytes
 
         # This signal is used to communicate an error in the pipeline to the driving
         # FSM state DMA_READ_PIPELINE.
