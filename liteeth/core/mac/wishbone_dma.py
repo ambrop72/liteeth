@@ -518,7 +518,9 @@ class WishboneStreamDMARead(Module, AutoCSR, _WishboneStreamDMABase):
         p2_data = Signal(wb_data_width)
 
         # Pipeline stage 2: Read the data word from Wishbone.
-        self.comb += [
+        wb_read_fsm = FSM()
+        self.submodules._wb_read_fsm = wb_read_fsm
+        wb_read_fsm.act("DEF",
             If(p1_valid and (not p2_valid or p2_ready),
                 wb_master.adr.eq(p1_buffer_addr),
                 wb_master.sel.eq(p1_data_sel),
@@ -526,52 +528,44 @@ class WishboneStreamDMARead(Module, AutoCSR, _WishboneStreamDMABase):
                 wb_master.stb.eq(1),
                 wb_master.we.eq(0),
                 If(wb_master.err,
+                    p1_ready.eq(1),
                     wb_error.eq(1)
-                ),
-                If(wb_master.err or wb_master.ack,
-                    p1_ready.eq(1)
+                )
+                .Elif(wb_master.ack,
+                    p1_ready.eq(1),
+                    NextValue(p2_valid, 1),
+                    NextValue(p2_last_be, p1_last_be),
+                    NextValue(p2_last_word_in_packet, p1_last_word_in_packet),
+                    NextValue(p2_data, wb_master.dat_r)
                 )
             )
-        ]
-        self.sync += [
-            If(p1_valid and (not p2_valid or p2_ready),
-                If(wb_master.ack,
-                    p2_valid.eq(1),
-                    p2_last_be.eq(p1_last_be),
-                    p2_last_word_in_packet.eq(p1_last_word_in_packet),
-                    p2_data.eq(wb_master.dat_r)
-                )
-            )
-        ]
+        )
 
-        # Finally connect the output of the last stage with the stream. The only
-        # nontrivial thing is generation of source.first.
-
-        # This signal indicates whether the next data word will start a new packet. It
-        # is a state that persists across processing of individual buffers.
+        # Pipeline stage 3: Transfer the data to the stream (this isn't much of a stage
+        # because it mostly just connects signals).
+        stream_output_fsm = FSM()
+        self.submodules._stream_output_fsm = stream_output_fsm
         first_word_in_packet = Signal(1, reset=1)
-
-        # Logic for first_word_in_packet.
-        self.sync += [
-            # Reset to 1 at soft reset.
-            If(self._doing_soft_reset,
-                first_word_in_packet.eq(1)
-            )
-            # Update whenever to source transfer occurs.
-            .Elif(p2_valid and p2_ready,
-                first_word_in_packet.eq(p2_last_word_in_packet)
-            )
-        ]
-
-        self.comb += [
+        stream_output_fsm.act("DEF",
+            # Connect the stream and the previous pipeline stage.
             p2_ready.eq(source.ready),
             source.valid.eq(p2_valid),
-            source.first.eq(first_word_in_packet),
+            source.last_be.eq(p2_last_be),
             source.last.eq(p2_last_word_in_packet),
             source.data.eq(p2_data),
-            source.last_be.eq(p2_last_be),
-            source.error.eq(0)
-        ]
+
+            # Generate the error signal. TODO
+            source.error.eq(0),
+
+            # Generate source.first. TODO
+            source.first.eq(first_word_in_packet),
+            If(self._doing_soft_reset,
+                NextValue(first_word_in_packet, 1)
+            )
+            .Elif(p2_valid and p2_ready,
+                NextValue(first_word_in_packet, p2_last_word_in_packet)
+            )
+        )
 
 
 class WishboneStreamDMAWrite(Module, AutoCSR, _WishboneStreamDMABase):
