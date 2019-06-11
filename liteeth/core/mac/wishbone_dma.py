@@ -28,6 +28,16 @@ def _check_stream_and_get_data_width(stream_desc):
     return payload_fields["data"][1]
 
 
+def _auto_clear_valid(module, ready, valid):
+    # Clear valid when data is tranferred if there is no next data. When there
+    # is next data this assignment is overridden in subsequent code.
+    module.sync += [
+        If(valid and ready,
+            valid.eq(0)
+        )
+    ]
+
+
 class _WishboneStreamDMABase(object):
     def __init__(self, stream_desc, wb_data_width, wb_adr_width, process_fsm_state):
         # We support only 32-bit or 64-bit wishbone data width.
@@ -269,7 +279,7 @@ class _WishboneStreamDMABase(object):
         #   the buffer descriptor).
 
         fsm = FSM(reset_state="WAIT_BUFFER")
-        self.submodules.fsm = fsm
+        self.submodules._fsm = fsm
 
         # Temporary storage for the descriptor address.
         desc_addr = Signal(wb_adr_width)
@@ -436,27 +446,25 @@ class WishboneStreamDMARead(Module, AutoCSR, _WishboneStreamDMABase):
         source = stream.Endpoint(stream_desc)
         self.source = source
 
-        fsm = self.fsm
         wb_master = self.wb_master
         wb_data_width_bytes = self._wb_data_width_bytes
+        fsm = self._fsm
 
         # This signal is used to communicate an error in the pipeline to the driving
         # FSM state DMA_READ_PIPELINE.
         wb_error = Signal(1)
 
-        # Pipeline stage 1: check the remaining number of bytes and calculate a bunch
-        # of stuff needed in further stages.
+        # Signals for communication with the next pipeline stage.
         p1_ready = Signal(1)
         p1_valid = Signal(1)
+        _auto_clear_valid(self, p1_ready, p1_valid)
         p1_buffer_addr = Signal(wb_adr_width)
         p1_data_sel = Signal(wb_data_width_bytes)
         p1_last_be = Signal(wb_data_width_bytes)
         p1_last_word_in_packet = Signal(1)
 
-        # Clear p1_valid when data is tranferred if there is no next data. When there
-        # is next data this assignment is overridden in code below.
-        self.sync += If(p1_valid and p1_ready, p1_valid.eq(0))
-
+        # Pipeline stage 1: Check the remaining number of bytes and calculate a bunch of
+        # stuff needed in subsequent pipeline stages.
         fsm.act("DMA_READ_PIPELINE",
             If(wb_error,
                 # Wishbone read error, handle by going to ERROR state. There is no need
@@ -501,15 +509,15 @@ class WishboneStreamDMARead(Module, AutoCSR, _WishboneStreamDMABase):
             )
         )
 
-        # Pipeline stage 2: Read the data word from Wishbone.
+        # Signals for communication with the next pipeline stage.
         p2_ready = Signal(1)
         p2_valid = Signal(1)
+        _auto_clear_valid(self, p2_ready, p2_valid)
         p2_last_be = Signal(wb_data_width_bytes)
         p2_last_word_in_packet = Signal(1)
         p2_data = Signal(wb_data_width)
 
-        self.sync += If(p2_valid and p2_ready, p2_valid.eq(0))
-
+        # Pipeline stage 2: Read the data word from Wishbone.
         self.comb += [
             If(p1_valid and (not p2_valid or p2_ready),
                 wb_master.adr.eq(p1_buffer_addr),
