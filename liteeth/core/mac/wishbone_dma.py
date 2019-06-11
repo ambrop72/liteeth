@@ -469,8 +469,8 @@ class WishboneStreamDMARead(Module, AutoCSR, _WishboneStreamDMABase):
         fsm.act("DMA_READ_PIPELINE",
             If(wb_error,
                 # Wishbone read error, handle by going to ERROR state. There is no need
-                # sync with the pipeline because the data is accepted when an error occurs
-                # and there is no additional pipeline stage in between.
+                # sync with the pipeline because the data was discarded and there is no
+                # additional pipeline stage in between.
                 NextState("ERROR")
             )
             .Elif(self._buffer_data_size == 0,
@@ -496,24 +496,24 @@ class WishboneStreamDMARead(Module, AutoCSR, _WishboneStreamDMABase):
                     NextValue(p1_buffer_addr, self._buffer_addr),
                     # Increment the buffer address.
                     NextValue(self._buffer_addr, self._buffer_addr + 1),
-                    # Check if this is the last data in this buffer.
-                    If(self._buffer_data_size <= wb_data_width_bytes, # last data
-                        # Calculate data_sel and last_be based on the remaining number of
-                        # bytes.
+                    # Determine _data_sel and decrement _buffer_data_size.
+                    If(self._buffer_data_size <= wb_data_width_bytes,
                         NextValue(p1_data_sel, (1 << self._buffer_data_size) - 1),
-                        NextValue(p1_last_be, 1 << (self._buffer_data_size - 1)),
-                        # This is the last data in the packet if this is the last buffer.
-                        NextValue(p1_last, self._buffer_last),
-                        # Update _buffer_data_size to 0, there is no more data in this buffer.
                         NextValue(self._buffer_data_size, 0)
-                    ).Else( # not last data
-                        # Set data_sel and last_be for a full data.
+                    ).Else(
                         NextValue(p1_data_sel, (1 << wb_data_width_bytes) - 1),
-                        NextValue(p1_last_be, 0),
-                        # This is not the last data in the packet.
-                        NextValue(p1_last, 0),
-                        # Decrement _buffer_data_size by the number of bytes in this data.
                         NextValue(self._buffer_data_size, self._buffer_data_size - wb_data_width_bytes)
+                    ),
+                    # Check if this is the last data in the packet.
+                    If(self._buffer_last and self._buffer_data_size <= wb_data_width_bytes,
+                        # Last data, calculate data_sel and last_be based on the remaining
+                        # number of bytes.
+                        NextValue(p1_last, 1),
+                        NextValue(p1_last_be, 1 << (self._buffer_data_size - 1))
+                    ).Else(
+                        # Not last data.
+                        NextValue(p1_last, 0),
+                        NextValue(p1_last_be, 0)
                     )
                 )
             )
