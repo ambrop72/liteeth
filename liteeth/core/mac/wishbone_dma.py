@@ -423,6 +423,7 @@ class _WishboneStreamDMABase(object):
                 If(self._update_descriptor_value[30], # end-of-packet bit
                     NextValue(self._releasing_last_buffer_in_packet, 1)
                 ),
+                # Continue processing subsequent buffers.
                 NextState("WAIT_BUFFER")
             )
         )
@@ -461,49 +462,58 @@ class WishboneStreamDMARead(Module, AutoCSR, _WishboneStreamDMABase):
         p1_buffer_addr = Signal(wb_adr_width)
         p1_data_sel = Signal(wb_data_width_bytes)
         p1_last_be = Signal(wb_data_width_bytes)
-        p1_last_word_in_packet = Signal(1)
+        p1_last = Signal(1)
 
         # Pipeline stage 1: Check the remaining number of bytes and calculate a bunch of
         # stuff needed in subsequent pipeline stages.
         fsm.act("DMA_READ_PIPELINE",
             If(wb_error,
                 # Wishbone read error, handle by going to ERROR state. There is no need
-                # sync with the pipeline because the reading is done right in the next
-                # pipeline stage and after a read error the data is accepted (i.e.
-                # p1_ready must also be true here).
+                # sync with the pipeline because the data is accepted when an error occurs
+                # and there is no additional pipeline stage in between.
                 NextState("ERROR")
             )
             .Elif(self._buffer_data_size == 0,
-                # Before we can continue we need to make sure that the next pipeline
-                # stage is done with reading from this buffer. But it is simple, just
-                # check p1_valid.
+                # Before we can continue we need to wait until the next pipeline stage is
+                # done reading from this buffer.
                 If(not p1_valid,
-                    # We're done, make sure the _ring_count is decremented and continue
-                    # with the next buffers.
+                    # Make sure that _ring_count will be decremented.
                     NextValue(self._ring_count_dec, 1),
                     # Generate the interrupt for the last buffer in a packet (if enabled).
-                    If(self._buffer_last, # end-of-packet bit
+                    If(self._buffer_last,
                         NextValue(self._releasing_last_buffer_in_packet, 1)
                     ),
+                    # Continue processing subsequent buffers.
                     NextState("WAIT_BUFFER")
                 )
-            ).
-            Else(
-                # Generate data for the next pipeline stage.
+            )
+            .Else(
+                # Wait until the next pipeline stage can accept our data.
                 If(not p1_valid or p1_ready,
+                    # Pass data for the next stage...
                     NextValue(p1_valid, 1),
+                    # Forward the buffer address.
                     NextValue(p1_buffer_addr, self._buffer_addr),
+                    # Increment the buffer address.
                     NextValue(self._buffer_addr, self._buffer_addr + 1),
-                    If(self._buffer_data_size <= wb_data_width_bytes,
-                        NextValue(self._buffer_data_size, 0),
+                    # Check if this is the last data in this buffer.
+                    If(self._buffer_data_size <= wb_data_width_bytes, # last data
+                        # Calculate data_sel and last_be based on the remaining number of
+                        # bytes.
                         NextValue(p1_data_sel, (1 << self._buffer_data_size) - 1),
                         NextValue(p1_last_be, 1 << (self._buffer_data_size - 1)),
-                        NextValue(p1_last_word_in_packet, self._buffer_last)
-                    ).Else(
-                        NextValue(self._buffer_data_size, self._buffer_data_size - wb_data_width_bytes),
+                        # This is the last data in the packet if this is the last buffer.
+                        NextValue(p1_last, self._buffer_last),
+                        # Update _buffer_data_size to 0, there is no more data in this buffer.
+                        NextValue(self._buffer_data_size, 0)
+                    ).Else( # not last data
+                        # Set data_sel and last_be for a full data.
                         NextValue(p1_data_sel, (1 << wb_data_width_bytes) - 1),
                         NextValue(p1_last_be, 0),
-                        NextValue(p1_last_word_in_packet, 0)
+                        # This is not the last data in the packet.
+                        NextValue(p1_last, 0),
+                        # Decrement _buffer_data_size by the number of bytes in this data.
+                        NextValue(self._buffer_data_size, self._buffer_data_size - wb_data_width_bytes)
                     )
                 )
             )
@@ -535,7 +545,7 @@ class WishboneStreamDMARead(Module, AutoCSR, _WishboneStreamDMABase):
                     p1_ready.eq(1),
                     NextValue(p2_valid, 1),
                     NextValue(p2_last_be, p1_last_be),
-                    NextValue(p2_last_word_in_packet, p1_last_word_in_packet),
+                    NextValue(p2_last_word_in_packet, p1_last),
                     NextValue(p2_data, wb_master.dat_r)
                 )
             )
