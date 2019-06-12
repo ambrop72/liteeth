@@ -618,15 +618,23 @@ class WishboneStreamDMAWrite(Module, AutoCSR, _WishboneStreamDMABase):
 
 
 class LiteEthMACWishboneDMA(Module, AutoCSR):
-    def __init__(self, eth_dw, wb_data_width=32, wb_adr_width=30):
+    def __init__(self, eth_dw, fifo_depth=20, wb_data_width=32, wb_adr_width=30):
 
         stream_desc = eth_phy_description(eth_dw)
 
         self.submodules.dma_tx = WishboneStreamDMARead(stream_desc, wb_data_width, wb_adr_width)
         self.submodules.dma_rx = WishboneStreamDMAWrite(stream_desc, wb_data_width, wb_adr_width)
 
-        self.source = self.dma_tx.source
-        self.sink = self.dma_rx.sink
+        self.submodules.fifo_tx = stream.SyncFIFO(stream_desc, fifo_depth)
+        self.submodules.fifo_rx = stream.SyncFIFO(stream_desc, fifo_depth)
+
+        self.fifo_tx.sink.connect(self.dma_tx.source)
+        self.fifo_rx.source.connect(self.dma_rx.sink)
+
+        # TODO: TX fifo should delay starting output until it's completely filled!
+
+        self.source = self.fifo_tx.source
+        self.sink = self.fifo_rx.sink
 
         self.wb_master_tx = self.dma_tx.wb_master
         self.wb_master_rx = self.dma_rx.wb_master
