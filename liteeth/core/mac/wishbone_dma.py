@@ -6,7 +6,7 @@ from migen.genlib.fsm import FSM, NextState, NextValue
 
 from litex.soc.interconnect import wishbone, stream
 from litex.soc.interconnect.csr import CSRStorage, CSRStatus, CSRConstant, AutoCSR
-from litex.soc.interconnect.csr_eventmanager import EventManager, EventSourceLevel
+from litex.soc.interconnect.csr_eventmanager import EventManager, EventSourceLevel, SharedIRQ
 
 from liteeth.core.mac import eth_phy_description
 
@@ -631,6 +631,5 @@ class LiteEthMACWishboneDMA(Module, AutoCSR):
         self.wb_master_tx = self.dma_tx.wb_master
         self.wb_master_rx = self.dma_rx.wb_master
 
-        self.ev_tx = self.dma_tx.ev
-        self.ev_rx = self.dma_rx.ev
+        self.submodules.ev = SharedIRQ(self.dma_tx.ev, self.dma_rx.ev)
 

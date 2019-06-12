@@ -37,8 +37,7 @@ class LiteEthMAC(Module, AutoCSR):
             self.comb += Port.connect(self.wishbone_dma, self.core)
             self.wb_master_tx = self.wishbone_dma.wb_master_tx
             self.wb_master_rx = self.wishbone_dma.wb_master_rx
-            self.ev_tx = self.wishbone_dma.ev_tx
-            self.ev_rx = self.wishbone_dma.ev_rx
+            self.ev = self.wishbone_dma.ev
             self.csrs = self.wishbone_dma.get_csrs() + self.core.get_csrs()
         else:
             raise NotImplementedError
