@@ -32,7 +32,7 @@ def _auto_clear_valid(module, ready, valid):
     # Clear valid when data is tranferred if there is no next data. When there
     # is next data this assignment is overridden in subsequent code.
     module.sync += [
-        If(valid and ready,
+        If(valid & ready,
             valid.eq(0)
         )
     ]
@@ -335,7 +335,7 @@ class _WishboneStreamDMABase(object):
             return [
                 NextValue(self._buffer_size, desc_second_word[0:buffer_size_bits]),
                 NextValue(self._buffer_data_size, desc_second_word[15:15+buffer_size_bits]),
-                NextValue(self._buffer_last, desc_second_word[30]),
+                NextValue(self._buffer_last, desc_second_word[30])
             ]
 
         fsm.act("READ_DESC_1",
@@ -349,12 +349,12 @@ class _WishboneStreamDMABase(object):
                 NextState("ERROR")
             )
             .Elif(wb_master.ack,
-                If(wb_data_width == 32,
+                (
                     # Store the first word, continue reading the second word.
                     *save_desc_first_word(wb_master.dat_r),
                     NextValue(desc_addr, desc_addr + 1),
                     NextState("READ_DESC_2")
-                ).Else(
+                ) if wb_data_width == 32 else (
                     # Store the descriptor and continue processing in the derived class.
                     *save_desc_first_word(wb_master.dat_r[0:32]),
                     *save_desc_second_word(wb_master.dat_r[32:64]),
@@ -575,11 +575,12 @@ class WishboneStreamDMARead(Module, AutoCSR, _WishboneStreamDMABase):
                 )
             )
         )
+        wb_read_fsm.act("DUMMY")
 
         # Pipeline stage 3: Transfer the data to the stream.
         stream_output_fsm = FSM()
         self.submodules._stream_output_fsm = stream_output_fsm
-        stream_output_fsm.act("DEF",            
+        stream_output_fsm.act("DEF",
             If(p2_valid,
                 source.valid.eq(1),
                 source.first.eq(p2_first),
@@ -592,6 +593,7 @@ class WishboneStreamDMARead(Module, AutoCSR, _WishboneStreamDMABase):
                 )
             )
         )
+        stream_output_fsm.act("DUMMY")
 
 
 class WishboneStreamDMAWrite(Module, AutoCSR, _WishboneStreamDMABase):
