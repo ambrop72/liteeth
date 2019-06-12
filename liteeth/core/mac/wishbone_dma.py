@@ -205,7 +205,7 @@ class _WishboneStreamDMABase(object):
 
         # Logic for generating the interrupt when _ring_count becomes 0.
         self.sync += [
-            If(self._interrupt_enabled and self._ring_count != 0 and self._next_ring_count == 0,
+            If(self._interrupt_enabled & (self._ring_count != 0) & (self._next_ring_count == 0),
                 self._interrupt_active.eq(1)
             )
         ]
@@ -215,7 +215,7 @@ class _WishboneStreamDMABase(object):
         # other code when this happens.
         self._releasing_last_buffer_in_packet = Signal(1)
         self.sync += [
-            If(self._interrupt_enabled and self._releasing_last_buffer_in_packet,
+            If(self._interrupt_enabled & self._releasing_last_buffer_in_packet,
                 self._interrupt_active.eq(1)
             ),
             self._releasing_last_buffer_in_packet.eq(0) # clear automatically
@@ -223,14 +223,14 @@ class _WishboneStreamDMABase(object):
 
         # Logic for updating _csr_ring_count when requested by the CPU.
         self.sync += [
-            If(self._csr_ctrl.re and self._csr_ctrl.storage[0],
+            If(self._csr_ctrl.re & self._csr_ctrl.storage[0],
                 self._csr_ring_count.status.eq(self._ring_count)
             )
         ]
         
         # Latch a soft reset request.
         self.sync += [
-            If(self._csr_ctrl.re and self._csr_ctrl.storage[1],
+            If(self._csr_ctrl.re & self._csr_ctrl.storage[1],
                 self._stat_soft_reset.eq(1)
             )
         ]
@@ -245,11 +245,11 @@ class _WishboneStreamDMABase(object):
 
         # Logic for enabling and disabling the interrupt via _csr_ctrl.
         self.sync += [
-            If(self._csr_ctrl.re and self._csr_ctrl.storage[3],
+            If(self._csr_ctrl.re & self._csr_ctrl.storage[3],
                 # Disable the interrupt.
                 self._interrupt_enabled.eq(0)
             )
-            .Elif(self._csr_ctrl.re and self._csr_ctrl.storage[2],
+            .Elif(self._csr_ctrl.re & self._csr_ctrl.storage[2],
                 # Enable the interrupt.
                 self._interrupt_enabled.eq(1)
             )
@@ -258,7 +258,7 @@ class _WishboneStreamDMABase(object):
         # Logic for clearing the interrupt. Note that this takes precedence over generating
         # the interrupt, but it shouldn't matter what the behavior is.
         self.sync += [
-            If(self._csr_ctrl.re and (self._csr_ctrl.storage[3] or self._csr_ctrl.storage[4]),
+            If(self._csr_ctrl.re & (self._csr_ctrl.storage[3] | self._csr_ctrl.storage[4]),
                 self._interrupt_active.eq(0)
             )
         ]
@@ -474,7 +474,7 @@ class WishboneStreamDMARead(Module, AutoCSR, _WishboneStreamDMABase):
             .Elif(self._buffer_data_size == 0,
                 # Before we can continue we need to wait until the next pipeline stage is
                 # done reading from the current buffer.
-                If(not p1_valid or p1_ready,
+                If(~p1_valid | p1_ready,
                     # Make sure that _ring_count will be decremented.
                     NextValue(self._ring_count_dec, 1),
                     # Generate the interrupt for the last buffer in a packet (if enabled).
@@ -487,7 +487,7 @@ class WishboneStreamDMARead(Module, AutoCSR, _WishboneStreamDMABase):
             )
             .Else(
                 # Wait until the next pipeline stage can accept our data.
-                If(not p1_valid or p1_ready,
+                If(~p1_valid | p1_ready,
                     # Pass data for the next stage...
                     NextValue(p1_valid, 1),
                     # Forward the buffer address.
@@ -503,7 +503,7 @@ class WishboneStreamDMARead(Module, AutoCSR, _WishboneStreamDMABase):
                         NextValue(self._buffer_data_size, self._buffer_data_size - wb_data_width_bytes)
                     ),
                     # Check if this is the last data in the packet.
-                    If(self._buffer_last and self._buffer_data_size <= wb_data_width_bytes,
+                    If(self._buffer_last & (self._buffer_data_size <= wb_data_width_bytes),
                         # Last data, calculate data_sel and last_be based on the remaining
                         # number of bytes.
                         NextValue(p1_last, 1),
@@ -535,7 +535,7 @@ class WishboneStreamDMARead(Module, AutoCSR, _WishboneStreamDMABase):
         sending_error = Signal(1)
         
         wb_read_fsm.act("DEF",
-            If(not sending_error and p1_valid and (not p2_valid or p2_ready),
+            If(~sending_error & p1_valid & (~p2_valid | p2_ready),
                 wb_master.adr.eq(p1_buffer_addr),
                 wb_master.sel.eq(p1_data_sel),
                 wb_master.cyc.eq(1),
@@ -548,20 +548,20 @@ class WishboneStreamDMARead(Module, AutoCSR, _WishboneStreamDMABase):
                 .Elif(wb_master.ack,
                     p1_ready.eq(1),
                     NextValue(p2_valid, 1),
-                    NextValue(p2_first, not packet_active),
+                    NextValue(p2_first, ~packet_active),
                     NextValue(p2_last, p1_last),
                     NextValue(p2_last_be, p1_last_be),
                     NextValue(p2_data, wb_master.dat_r),
                     NextValue(p2_error, 0),
-                    NextValue(packet_active, not p1_last)
+                    NextValue(packet_active, ~p1_last)
                 )
             )
             # If an error occurs or soft reset is done while we are in the middle of
             # a packet, terminate the packet with an error. Note that we cannot miss an
             # error due to the If above which takes precedence over this check, because
             # of the synchronization with the main FSM.
-            .Elif(sending_error or (packet_active and (self._stat_err or self._doing_soft_reset)),
-                If(not p2_valid or p2_ready,
+            .Elif(sending_error | (packet_active & (self._stat_err | self._doing_soft_reset)),
+                If(~p2_valid | p2_ready,
                     NextValue(p2_valid, 1),
                     NextValue(p2_first, 0),
                     NextValue(p2_last, 1),
