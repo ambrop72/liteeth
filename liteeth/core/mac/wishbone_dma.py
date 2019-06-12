@@ -394,8 +394,6 @@ class _WishboneStreamDMABase(object):
         #   _releasing_last_buffer_in_packet if needed, not the derived class.
         # - ERROR: If there was an error. It does not matter whether the _ring_count was
         #   decremented.
-        # - When _stat_soft_reset is active, transition directly to WAIT_BUFFER is
-        #   allowed, where the soft reset will be done.
 
         # If the transition was to WRITE_DESC, the base class assigns the value to
         # be written to the second word of the descriptor to this signal.
@@ -461,8 +459,8 @@ class WishboneStreamDMARead(Module, AutoCSR, _WishboneStreamDMABase):
         _auto_clear_valid(self, p1_ready, p1_valid)
         p1_buffer_addr = Signal(wb_adr_width)
         p1_data_sel = Signal(wb_data_width_bytes)
-        p1_last_be = Signal(wb_data_width_bytes)
         p1_last = Signal(1)
+        p1_last_be = Signal(wb_data_width_bytes)
 
         # Pipeline stage 1: Check the remaining number of bytes and calculate a bunch of
         # stuff needed in subsequent pipeline stages.
@@ -475,8 +473,8 @@ class WishboneStreamDMARead(Module, AutoCSR, _WishboneStreamDMABase):
             )
             .Elif(self._buffer_data_size == 0,
                 # Before we can continue we need to wait until the next pipeline stage is
-                # done reading from this buffer.
-                If(not p1_valid,
+                # done reading from the current buffer.
+                If(not p1_valid or p1_ready,
                     # Make sure that _ring_count will be decremented.
                     NextValue(self._ring_count_dec, 1),
                     # Generate the interrupt for the last buffer in a packet (if enabled).
@@ -523,15 +521,21 @@ class WishboneStreamDMARead(Module, AutoCSR, _WishboneStreamDMABase):
         p2_ready = Signal(1)
         p2_valid = Signal(1)
         _auto_clear_valid(self, p2_ready, p2_valid)
+        p2_first = Signal(1)
+        p2_last = Signal(1)
         p2_last_be = Signal(wb_data_width_bytes)
-        p2_last_word_in_packet = Signal(1)
         p2_data = Signal(wb_data_width)
+        p2_error = Signal(1)
 
         # Pipeline stage 2: Read the data word from Wishbone.
         wb_read_fsm = FSM()
         self.submodules._wb_read_fsm = wb_read_fsm
+
+        packet_active = Signal(1)
+        sending_error = Signal(1)
+        
         wb_read_fsm.act("DEF",
-            If(p1_valid and (not p2_valid or p2_ready),
+            If(not sending_error and p1_valid and (not p2_valid or p2_ready),
                 wb_master.adr.eq(p1_buffer_addr),
                 wb_master.sel.eq(p1_data_sel),
                 wb_master.cyc.eq(1),
@@ -544,36 +548,48 @@ class WishboneStreamDMARead(Module, AutoCSR, _WishboneStreamDMABase):
                 .Elif(wb_master.ack,
                     p1_ready.eq(1),
                     NextValue(p2_valid, 1),
+                    NextValue(p2_first, not packet_active),
+                    NextValue(p2_last, p1_last),
                     NextValue(p2_last_be, p1_last_be),
-                    NextValue(p2_last_word_in_packet, p1_last),
-                    NextValue(p2_data, wb_master.dat_r)
+                    NextValue(p2_data, wb_master.dat_r),
+                    NextValue(p2_error, 0),
+                    NextValue(packet_active, not p1_last)
+                )
+            )
+            # If an error occurs or soft reset is done while we are in the middle of
+            # a packet, terminate the packet with an error. Note that we cannot miss an
+            # error due to the If above which takes precedence over this check, because
+            # of the synchronization with the main FSM.
+            .Elif(sending_error or (packet_active and (self._stat_err or self._doing_soft_reset)),
+                If(not p2_valid or p2_ready,
+                    NextValue(p2_valid, 1),
+                    NextValue(p2_first, 0),
+                    NextValue(p2_last, 1),
+                    NextValue(p2_last_be, 0),
+                    NextValue(p2_data, 0),
+                    NextValue(p2_error, 1),
+                    NextValue(packet_active, 0),
+                    NextValue(sending_error, 0)
+                ).Else(
+                    NextValue(sending_error, 1)
                 )
             )
         )
 
-        # Pipeline stage 3: Transfer the data to the stream (this isn't much of a stage
-        # because it mostly just connects signals).
+        # Pipeline stage 3: Transfer the data to the stream.
         stream_output_fsm = FSM()
         self.submodules._stream_output_fsm = stream_output_fsm
-        first_word_in_packet = Signal(1, reset=1)
-        stream_output_fsm.act("DEF",
-            # Connect the stream and the previous pipeline stage.
-            p2_ready.eq(source.ready),
-            source.valid.eq(p2_valid),
-            source.last_be.eq(p2_last_be),
-            source.last.eq(p2_last_word_in_packet),
-            source.data.eq(p2_data),
-
-            # Generate the error signal. TODO
-            source.error.eq(0),
-
-            # Generate source.first. TODO
-            source.first.eq(first_word_in_packet),
-            If(self._doing_soft_reset,
-                NextValue(first_word_in_packet, 1)
-            )
-            .Elif(p2_valid and p2_ready,
-                NextValue(first_word_in_packet, p2_last_word_in_packet)
+        stream_output_fsm.act("DEF",            
+            If(p2_valid,
+                source.valid.eq(1),
+                source.first.eq(p2_first),
+                source.last.eq(p2_last),
+                source.last_be.eq(p2_last_be),
+                source.data.eq(p2_data),
+                source.error.eq(p2_error),
+                If(source.ready,
+                    p2_ready.eq(1)
+                )
             )
         )
 
