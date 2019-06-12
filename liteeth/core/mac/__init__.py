@@ -33,12 +33,13 @@ class LiteEthMAC(Module, AutoCSR):
             self.ev, self.bus = self.interface.sram.ev, self.interface.bus
             self.csrs = self.interface.get_csrs() + self.core.get_csrs()
         elif interface == "wishbone_dma":
-            self.submodules.wishbone_dma = LiteEthMACWishboneDMA(dw, endianness)
+            self.submodules.wishbone_dma = LiteEthMACWishboneDMA(dw)
             self.comb += Port.connect(self.wishbone_dma, self.core)
-            #self.ev = self.wishbone_dma.ev
-            self.csrs = self.wishbone_dma.get_csrs() + self.core.get_csrs()
             self.wb_master_tx = self.wishbone_dma.wb_master_tx
             self.wb_master_rx = self.wishbone_dma.wb_master_rx
+            self.ev_tx = self.wishbone_dma.ev_tx
+            self.ev_rx = self.wishbone_dma.ev_rx
+            self.csrs = self.wishbone_dma.get_csrs() + self.core.get_csrs()
         else:
             raise NotImplementedError
 

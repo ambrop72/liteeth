@@ -597,22 +597,38 @@ class WishboneStreamDMARead(Module, AutoCSR, _WishboneStreamDMABase):
 class WishboneStreamDMAWrite(Module, AutoCSR, _WishboneStreamDMABase):
     def __init__(self, stream_desc, wb_data_width=32, wb_adr_width=30):
         _WishboneStreamDMABase.__init__(
-            self, stream_desc, wb_data_width, wb_adr_width, "CHECK_BUF_POS")
+            self, stream_desc, wb_data_width, wb_adr_width, "DMA_WRITE_PIPELINE")
 
-        self.sink = stream.Endpoint(stream_desc)
+        sink = stream.Endpoint(stream_desc)
+        self.sink = sink
+
+        wb_master = self.wb_master
+        wb_data_width_bytes = self._wb_data_width_bytes
+        fsm = self._fsm
+
+        # TODO: Implement this!
+
+        fsm.act("DMA_WRITE_PIPELINE",
+            # Not implemented, just eat the buffer.
+            NextValue(self._ring_count_dec, 1),
+            NextState("WAIT_BUFFER")
+        )
 
 
 class LiteEthMACWishboneDMA(Module, AutoCSR):
-    def __init__(self, eth_dw, endianness, wb_data_width=32, wb_adr_width=30):
+    def __init__(self, eth_dw, wb_data_width=32, wb_adr_width=30):
 
         stream_desc = eth_phy_description(eth_dw)
 
         self.submodules.dma_tx = WishboneStreamDMARead(stream_desc, wb_data_width, wb_adr_width)
         self.submodules.dma_rx = WishboneStreamDMAWrite(stream_desc, wb_data_width, wb_adr_width)
 
+        self.source = self.dma_tx.source
+        self.sink = self.dma_rx.sink
+
         self.wb_master_tx = self.dma_tx.wb_master
         self.wb_master_rx = self.dma_rx.wb_master
 
-        self.sink = self.dma_tx.sink
-        self.source = self.dma_rx.source
+        self.ev_tx = self.dma_tx.ev
+        self.ev_rx = self.dma_rx.ev
 
