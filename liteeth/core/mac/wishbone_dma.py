@@ -617,6 +617,47 @@ class WishboneStreamDMAWrite(Module, AutoCSR, _WishboneStreamDMABase):
         )
 
 
+class _SyncPacketTxFIFO(Module):
+    def __init__(self, layout, depth, buffered=False):
+        self.submodules.base_fifo = stream.SyncFIFO(layout, depth, buffered)
+
+        sink = self.base_fifo.sink
+        base_source = self.base_fifo.source
+
+        self.sink = sink
+        self.source = stream.Endpoint(layout)
+        self.depth = self.base_fifo.depth
+        self.level = self.base_fifo.level
+
+        num_last = Signal(max = depth + 1)
+
+        self.sync += [
+            num_last.eq(num_last
+                + (sink.valid & sink.ready & sink.last)
+                - (base_source.valid & base_source.ready & base_source.last))
+        ]
+
+        allow_transfer = Signal(1)
+        new_packet = Signal(1, reset=1)
+
+        self.comb += [
+            allow_transfer.eq(~new_packet |
+                (num_last > 0) | (self.base_fifo.level == self.base_fifo.depth)),
+            self.source.valid.eq(base_source.valid & allow_transfer),
+            self.source.first.eq(base_source.first),
+            self.source.last.eq(base_source.last),
+            self.source.payload.eq(base_source.payload),
+            self.source.param.eq(base_source.param),
+            base_source.ready.eq(allow_transfer & self.source.ready)
+        ]
+
+        self.sync += [
+            If(base_source.valid & base_source.ready,
+                new_packet.eq(base_source.last)
+            )
+        ]
+
+
 class LiteEthMACWishboneDMA(Module, AutoCSR):
     def __init__(self, eth_dw, fifo_depth=20, wb_data_width=32, wb_adr_width=30):
 
@@ -625,7 +666,7 @@ class LiteEthMACWishboneDMA(Module, AutoCSR):
         self.submodules.dma_tx = WishboneStreamDMARead(stream_desc, wb_data_width, wb_adr_width)
         self.submodules.dma_rx = WishboneStreamDMAWrite(stream_desc, wb_data_width, wb_adr_width)
 
-        self.submodules.fifo_tx = stream.SyncFIFO(stream_desc, fifo_depth)
+        self.submodules.fifo_tx = _SyncPacketTxFIFO(stream_desc, fifo_depth)
         self.submodules.fifo_rx = stream.SyncFIFO(stream_desc, fifo_depth)
 
         self.fifo_tx.sink.connect(self.dma_tx.source)
